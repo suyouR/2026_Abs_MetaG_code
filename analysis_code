@@ -1,0 +1,4376 @@
+required_packages <- c(
+  "tableone", "RColorBrewer", "Maaslin2", "compositions", "ggplot2",
+  "reshape2", "psych", "tidyr", "patchwork", "ggpubr", "rstatix",
+  "tidyverse", "cluster", "purrr", "vegan", "scales", "data.table",
+  "dplyr", "UpSetR", "ggalluvial", "ggridges", "ComplexHeatmap",
+  "ggrepel", "ggraph", "igraph", "matrixStats", "cowplot", "mediation",
+  "xlsx", "circlize", "pheatmap", "ggforce", "stringr", "tibble"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install required packages before running the analysis: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages(
+  invisible(lapply(required_packages, library, character.only = TRUE))
+)
+
+project_dir <- normalizePath(
+  Sys.getenv("PROJECT_DIR", unset = "."),
+  winslash = "/",
+  mustWork = FALSE
+)
+setwd(project_dir)
+
+input_dir <- file.path(project_dir, "input")
+metadata_dir <- file.path(input_dir, "metadata")
+reference_dir <- file.path(project_dir, "reference")
+output_dir <- file.path(project_dir, "output")
+
+output_subdirs <- c(
+  "Base_information", "Diversity", "MaAsLin", "MaAsLin_cor",
+  "Mediation", "Interaction"
+)
+
+invisible(
+  lapply(
+    file.path(output_dir, output_subdirs),
+    dir.create,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+)
+
+sample_id_mapping_file <- file.path(metadata_dir, "sample_id_mapping.xlsx")
+participant_metadata_file <- file.path(metadata_dir, "participant_metadata.csv")
+breakthrough_infection_file <- file.path(metadata_dir, "breakthrough_infection.csv")
+adverse_events_file <- file.path(metadata_dir, "adverse_events.csv")
+cytokine_file <- file.path(metadata_dir, "cytokines.csv")
+neutralizing_antibody_file <- file.path(metadata_dir, "neutralizing_antibody.csv")
+cytokine_classification_file <- file.path(reference_dir, "cytokine_classification.xlsx")
+pathway_classification_file <- file.path(reference_dir, "pathway_classification.txt")
+bmi_outlier_threshold <- 50
+
+sample_id_mapping_column <- Sys.getenv(
+  "SAMPLE_ID_MAPPING_COLUMN",
+  unset = "SOURCE_ID"
+)
+
+vaccine_a_code <- Sys.getenv("VACCINE_A_CODE", unset = "VACCINE_A")
+vaccine_b_code <- Sys.getenv("VACCINE_B_CODE", unset = "VACCINE_B")
+vaccine_c_code <- Sys.getenv("VACCINE_C_CODE", unset = "VACCINE_C")
+
+vaccine_code_map <- stats::setNames(
+  c("Vaccine_A", "Vaccine_B", "Vaccine_C"),
+  c(vaccine_a_code, vaccine_b_code, vaccine_c_code)
+)
+
+safe_file_name <- function(x) {
+  gsub("[^A-Za-z0-9._-]+", "_", x)
+}
+
+run_maaslin_outcomes <- function(
+    feature_data,
+    outcome_data,
+    metadata,
+    analysis_name,
+    baseline_data = NULL,
+    outcomes = colnames(outcome_data),
+    covariates = c("Gender", "Age", "BMI", "Vaccination")) {
+  feature_data <- as.data.frame(feature_data)
+  outcome_data <- as.data.frame(outcome_data)
+  metadata <- as.data.frame(metadata)
+
+  purrr::map_dfr(outcomes, function(outcome) {
+    ids <- intersect(as.character(metadata$ID), rownames(feature_data))
+    ids <- intersect(ids, rownames(outcome_data))
+    if (!is.null(baseline_data)) {
+      ids <- intersect(ids, rownames(baseline_data))
+    }
+
+    model_metadata <- metadata[match(ids, metadata$ID), , drop = FALSE]
+    model_metadata[[outcome]] <- outcome_data[ids, outcome, drop = TRUE]
+    fixed_effects <- c(outcome, covariates)
+
+    if (!is.null(baseline_data)) {
+      model_metadata$baseline_value <- baseline_data[ids, outcome, drop = TRUE]
+      fixed_effects <- c(outcome, "baseline_value", covariates)
+    }
+
+    rownames(model_metadata) <- model_metadata$ID
+    model_output <- file.path(
+      output_dir,
+      "MaAsLin",
+      analysis_name,
+      safe_file_name(outcome)
+    )
+    dir.create(model_output, recursive = TRUE, showWarnings = FALSE)
+
+    fit <- Maaslin2(
+      input_data = feature_data[ids, , drop = FALSE],
+      input_metadata = model_metadata,
+      fixed_effects = fixed_effects,
+      random_effects = NULL,
+      plot_heatmap = FALSE,
+      plot_scatter = FALSE,
+      normalization = "NONE",
+      transform = "NONE",
+      min_abundance = 0,
+      min_prevalence = 0,
+      min_variance = 0,
+      output = model_output
+    )
+
+    fit$results %>%
+      dplyr::filter(metadata == outcome) %>%
+      dplyr::mutate(
+        qval = p.adjust(pval, method = "fdr"),
+        outcome = outcome
+      )
+  })
+}
+
+run_diversity_associations <- function(
+    diversity_data,
+    outcome_data,
+    metadata,
+    baseline_data = NULL,
+    outcomes = colnames(outcome_data),
+    covariates = c("Gender", "Age", "BMI", "Vaccination"),
+    family = gaussian()) {
+  diversity_data <- as.data.frame(diversity_data)
+  outcome_data <- as.data.frame(outcome_data)
+  metadata <- as.data.frame(metadata)
+
+  purrr::map_dfr(outcomes, function(outcome) {
+    purrr::map_dfr(colnames(diversity_data), function(exposure) {
+      ids <- intersect(as.character(metadata$ID), rownames(diversity_data))
+      ids <- intersect(ids, rownames(outcome_data))
+      if (!is.null(baseline_data)) {
+        ids <- intersect(ids, rownames(baseline_data))
+      }
+
+      model_data <- metadata[match(ids, metadata$ID), , drop = FALSE]
+      model_data$outcome_value <- outcome_data[ids, outcome, drop = TRUE]
+      model_data$exposure_value <- diversity_data[ids, exposure, drop = TRUE]
+      terms <- c("exposure_value", covariates)
+
+      if (!is.null(baseline_data)) {
+        model_data$baseline_value <- baseline_data[ids, outcome, drop = TRUE]
+        terms <- c("exposure_value", "baseline_value", covariates)
+      }
+
+      fit <- glm(
+        reformulate(terms, response = "outcome_value"),
+        data = model_data,
+        family = family,
+        na.action = na.exclude
+      )
+      coefficient_table <- summary(fit)$coefficients
+
+      tibble::tibble(
+        x_variable = exposure,
+        y_variable = outcome,
+        coefficient = coefficient_table["exposure_value", 1],
+        p_value = coefficient_table["exposure_value", 4]
+      )
+    })
+  }) %>%
+    dplyr::group_by(y_variable) %>%
+    dplyr::mutate(FDR_p_value = p.adjust(p_value, method = "fdr")) %>%
+    dplyr::ungroup()
+}
+
+recode_pathway_group <- function(x) {
+  dplyr::recode(
+    x,
+    "Carbohydrates-Degradation" = "Carbohydrate metabolism",
+    "Carbohydrates-Biosynthesis" = "Carbohydrate metabolism",
+    "Lipid-Biosynthesis" = "Lipid biosynthesis",
+    "Amino-Acid-Biosynthesis" = "Amino acid metabolism",
+    "Nucleotide-Biosynthesis" = "Nucleotide metabolism",
+    "Nucleo-Deg" = "Nucleotide metabolism",
+    "Carboxylate-Biosynthesis" = "Amino acid metabolism",
+    "Cofactor-Biosynthesis" = "Cofactor biosynthesis",
+    "Other-biosynthesis" = "Cofactor biosynthesis",
+    "Energy-Metabolism" = "Carbohydrate metabolism",
+    "Secondary-Metabolite-Biosynthesis" = "Nucleotide metabolism",
+    "Polymer-Degradation" = "Carbohydrate metabolism",
+    "Cyclitols-Deg" = "Carbohydrate metabolism"
+  )
+}
+
+ID_match <- xlsx::read.xlsx2(
+  sample_id_mapping_file,
+  sheetIndex = 2,
+  startRow = 1
+)
+if (!sample_id_mapping_column %in% colnames(ID_match)) {
+  stop(
+    "Set SAMPLE_ID_MAPPING_COLUMN to the participant ID column in ",
+    sample_id_mapping_file
+  )
+}
+colnames(ID_match)[colnames(ID_match) == sample_id_mapping_column] <- "Source_ID"
+dat_metadata <- data.table::fread(participant_metadata_file)
+dat_metadata_2 <- dplyr::select(dat_metadata, V1:V7) %>%
+  setNames(as.character(.[2, ])) %>%
+  slice(-(1:2)) %>%
+  `rownames<-`(NULL) %>%
+  merge(., ID_match, by.x = "ID", by.y = "Source_ID", all.x = T)
+
+dat_metadata_vaccine_recode <- dat_metadata %>%
+  setNames(c(as.character(dat_metadata[2,])[1:7],
+             paste0(c("one_"),c("IV","AdV","RPV","mRNAV","non")),
+             paste0(c("two_"),c("IV","AdV","RPV","mRNAV","non")),
+             paste0(c("three_"),c("IV","AdV","RPV","mRNAV","non"))
+             )) %>%
+  slice(-(1:2)) %>%
+  `rownames<-`(NULL) %>%
+  merge(., ID_match, by.x = "ID", by.y = "Source_ID", all.x = T) %>%
+  mutate(across(one_IV:three_non, ~ as.factor(ifelse(. == 0, 0, 1))
+                ))
+summary(dat_metadata_vaccine_recode)
+
+dat_metadata_BTI <- data.table::fread(breakthrough_infection_file)
+dat_metadata_2 <- merge(dat_metadata_2, dat_metadata_BTI[,c("ID","infection_day","status")], by.x = "ID", by.y = "ID")
+dat_metadata_2 <- dat_metadata_2 %>%
+  mutate(BTI_day7 = ifelse(infection_day <= 7, 1, 0)) %>%
+  mutate(BTI_day14 = ifelse(infection_day <= 14, 1, 0)) %>%
+  mutate(BTI_day28 = ifelse(infection_day <= 28, 1, 0)) %>%
+  mutate(BTI_day90 = ifelse(infection_day <= 90, 1, 0)) %>%
+  mutate(BTI_day180 = ifelse(infection_day < 180, 1, 0)) %>%
+  mutate(
+    Vaccination = dplyr::recode(
+      as.character(Vaccination),
+      !!!vaccine_code_map
+    ),
+    across(
+      c(
+        Gender, Vaccination, status, BTI_day7, BTI_day14,
+        BTI_day28, BTI_day90, BTI_day180
+      ),
+      as.factor
+    )
+  ) %>%
+  mutate(across(c(Age,Height,Weight), as.numeric)) %>%
+  mutate(Weight = ifelse(Weight / (Height/100)^2 > bmi_outlier_threshold, Weight/2, Weight)) %>%
+  mutate(BMI = Weight / (Height/100)^2)
+summary(dat_metadata_2)
+
+dat_metadata_AE <- data.table::fread(adverse_events_file)
+dat_metadata_AE <- dat_metadata_AE %>% dplyr::select(-V1)
+
+dat_metadata_2 <- dat_metadata_AE %>%
+  mutate(pain = pmax(D1_pain, D2_pain, D3_pain, na.rm = TRUE)) %>%
+  mutate(swelling = pmax(D1_swelling, D2_swelling, D3_swelling, na.rm = TRUE)) %>%
+  mutate(acute.allergic.reaction = pmax(D1_acute.allergic.reaction, D2_acute.allergic.reaction, D3_acute.allergic.reaction, na.rm = TRUE)) %>%
+  mutate(vomitting = pmax(D1_vomitting, D2_vomitting, D3_vomitting, na.rm = TRUE)) %>%
+  mutate(jonit.pain = pmax(D1_jonit.pain, D2_jonit.pain, D3_jonit.pain, na.rm = TRUE)) %>%
+  mutate(Muscular.pain = pmax(D1_Muscular.pain, D2_Muscular.pain, D3_Muscular.pain, na.rm = TRUE)) %>%
+  mutate(headache = pmax(D1_headache, D2_headache, D3_headache, na.rm = TRUE)) %>%
+  mutate(cold = pmax(D1_cold, D2_cold, D3_cold, na.rm = TRUE)) %>%
+  mutate(fatigue = pmax(D1_fatigue, D2_fatigue, D3_fatigue, na.rm = TRUE)) %>%
+  mutate(fever = pmax(D1_fever, D2_fever, D3_fever, na.rm = TRUE)) %>%
+  dplyr::select(ID, pain, swelling, acute.allergic.reaction, vomitting, jonit.pain, Muscular.pain, headache, cold, fatigue, fever) %>%
+  merge(dat_metadata_2, ., by.x = "ID", by.y = "ID", all.x = T)
+
+dat_metadata_all <- dat_metadata_2
+
+dat_cytokines <- data.table::fread(cytokine_file)
+
+dat_cytokines_baseline <- filter(dat_cytokines, Batch == "Day0") %>% dplyr::select(., -V1, -Batch) %>%
+  tibble::column_to_rownames(., var = "ID") %>%
+  mutate_all(~ ifelse(. == -9999, 0.00000001, .))
+dat_cytokines_baseline_log <- dat_cytokines_baseline %>% mutate(across(`PDGF_BB`:CRP, log))
+
+dat_cytokines_baseline_median <- dat_cytokines_baseline %>%
+  mutate(across(
+    colnames(dat_cytokines_baseline),
+    ~ ifelse(
+      .x > median(.x, na.rm = TRUE),
+      "High",
+      "Low"
+    )
+  )) %>% mutate(across(
+    colnames(dat_cytokines_baseline),
+    ~ factor(.x, levels = c("Low", "High"))
+  ))
+
+dat_cytokines_day1 <- filter(dat_cytokines, Batch == "Day1") %>% dplyr::select(., -V1, -Batch) %>%
+  tibble::column_to_rownames(., var = "ID") %>%
+  mutate_all(~ ifelse(. == -9999, 0.00000001, .))
+dat_cytokines_day1_log <- dat_cytokines_day1 %>% mutate(across(`PDGF_BB`:CRP, log))
+
+dat_cytokines_day1_median <- dat_cytokines_day1 %>%
+  mutate(across(
+    colnames(dat_cytokines_day1),
+    ~ ifelse(
+      .x > median(.x, na.rm = TRUE),
+      "High",
+      "Low"
+    )
+  )) %>% mutate(across(
+    colnames(dat_cytokines_day1),
+    ~ factor(.x, levels = c("Low", "High"))
+  ))
+
+dat_cytokines_foldchange <- dat_cytokines_day1 / dat_cytokines_baseline
+
+type_cytokines <- xlsx::read.xlsx2(cytokine_classification_file,sheetIndex = 4, startRow = 2)
+
+type_cytokines_all <- xlsx::read.xlsx2(cytokine_classification_file,sheetIndex = 5, startRow = 2)
+
+dat_GMT <- data.table::fread(neutralizing_antibody_file)
+dat_GMT$Group <- dplyr::recode(
+  as.character(dat_GMT$Group),
+  !!!vaccine_code_map
+)
+
+dat_GMT_baseline <- filter(dat_GMT, Patch == "B1") %>%
+  reshape2::dcast(
+    ID + Group ~ `SARS-CoV-2`,
+    value.var = "Levels"
+  )
+
+rownames(dat_GMT_baseline) <- dat_GMT_baseline$ID
+dat_GMT_baseline <- dat_GMT_baseline %>%
+  dplyr::select(ID,Group, Prototype, Alpha, Beta, `BA.4/5`, BF.7, XBB.1.5, XBB.1.16, XBB.1.9.1, BQ.1.1, JN.1) %>%
+  rename(BA.4_5 = `BA.4/5`)
+dat_GMT_baseline_log <- dat_GMT_baseline %>% select(-ID,-Group) %>% mutate(across(Prototype:JN.1, log))
+
+dat_GMT_baseline_median <- dat_GMT_baseline_log %>%
+  mutate(across(
+    Prototype:JN.1,
+    ~ ifelse(
+      .x > median(.x, na.rm = TRUE),
+      "High",
+      "Low"
+    )
+  )) %>% mutate(across(
+    Prototype:JN.1,
+    ~ factor(.x, levels = c("Low", "High"))
+  ))
+summary(dat_GMT_baseline_median)
+
+dat_GMT_day7 <- dplyr::filter(dat_GMT, Patch == "B3") %>%
+  reshape2::dcast(
+    ID + Group ~ `SARS-CoV-2`,
+    value.var = "Levels"
+  ) %>%
+  {`rownames<-`(., .$ID)} %>%
+  dplyr::select(ID,Group, Prototype, Alpha, Beta, `BA.4/5`, BF.7, XBB.1.5, XBB.1.16, XBB.1.9.1, BQ.1.1) %>%
+  rename(BA.4_5 = `BA.4/5`) %>% dplyr::select(-ID,-Group)
+dat_GMT_day7_log <- dat_GMT_day7 %>% mutate(across(Prototype:BQ.1.1, log))
+
+dat_GMT_day14 <- filter(dat_GMT, Patch == "B4") %>%
+  reshape2::dcast(
+    ID + Group ~ `SARS-CoV-2`,
+    value.var = "Levels"
+  ) %>%
+  {`rownames<-`(., .$ID)} %>%
+  dplyr::select(ID,Group, Prototype, Alpha, Beta, `BA.4/5`, BF.7, XBB.1.5, XBB.1.16, XBB.1.9.1, BQ.1.1, JN.1) %>%
+  rename(BA.4_5 = `BA.4/5`) %>% mutate(Group = as.factor(Group)) %>% select(-ID,-Group)
+dat_GMT_day14_log <- dat_GMT_day14 %>% mutate(across(Prototype:JN.1, log))
+summary(dat_GMT_day14_log)
+
+dat_GMT_day14_median <- dat_GMT_day14 %>%
+  mutate(across(
+    Prototype:JN.1,
+    ~ ifelse(
+      .x > median(.x, na.rm = TRUE),
+      "High",
+      "Low"
+    )
+  )) %>% mutate(across(
+    Prototype:JN.1,
+    ~ factor(.x, levels = c("Low", "High"))
+  ))
+summary(dat_GMT_day14_median)
+
+dat_GMT_day14_mean <- dat_GMT_day14 %>%
+  mutate(across(
+    Prototype:JN.1,
+    ~ ifelse(
+      .x > mean(.x, na.rm = TRUE),
+      "High",
+      "Low"
+    )
+  )) %>% mutate(across(
+    Prototype:JN.1,
+    ~ factor(.x, levels = c("Low", "High"))
+  ))
+summary(dat_GMT_day14_mean)
+
+dat_GMT_day28 <- dplyr::filter(dat_GMT, Patch == "B5") %>%
+  reshape2::dcast(
+    ID + Group ~ `SARS-CoV-2`,
+    value.var = "Levels"
+  ) %>%
+  {`rownames<-`(., .$ID)} %>%
+  dplyr::select(ID,Group, Prototype, Alpha, Beta, `BA.4/5`, BF.7, XBB.1.5, XBB.1.16, XBB.1.9.1, BQ.1.1) %>%
+  rename(BA.4_5 = `BA.4/5`) %>% dplyr::select(-ID,-Group)
+dat_GMT_day28_log <- dat_GMT_day28 %>% mutate(across(Prototype:BQ.1.1, log))
+
+dat_GMT_day90 <- dplyr::filter(dat_GMT, Patch == "B6") %>%
+  reshape2::dcast(
+    ID + Group ~ `SARS-CoV-2`,
+    value.var = "Levels"
+  ) %>%
+  {`rownames<-`(., .$ID)} %>%
+  dplyr::select(ID,Group, Prototype, Alpha, Beta, `BA.4/5`, BF.7, XBB.1.5, XBB.1.16, XBB.1.9.1, BQ.1.1, JN.1) %>%
+  rename(BA.4_5 = `BA.4/5`) %>% dplyr::select(-ID,-Group)
+dat_GMT_day90_log <- dat_GMT_day90 %>% mutate(across(Prototype:JN.1, log))
+
+dat_GMT_day180 <- dplyr::filter(dat_GMT, Patch == "B7") %>%
+  reshape2::dcast(
+    ID + Group ~ `SARS-CoV-2`,
+    value.var = "Levels"
+  ) %>%
+  {`rownames<-`(., .$ID)} %>%
+  dplyr::select(ID,Group, Prototype, Alpha, Beta, `BA.4/5`, BF.7, XBB.1.5, XBB.1.16, XBB.1.9.1, BQ.1.1, JN.1) %>%
+  rename(BA.4_5 = `BA.4/5`) %>% dplyr::select(-ID,-Group)
+dat_GMT_day180_log <- dat_GMT_day180 %>% mutate(across(Prototype:JN.1, log))
+
+dat_GMT_response_pattern <- data.frame(allmag_baseline = rowMeans(dat_GMT_baseline_log, na.rm = TRUE),
+                             allmag_day7 = rowMeans(dat_GMT_day7_log[,1:9], na.rm = TRUE),
+                             allmag_day14 = rowMeans(dat_GMT_day14_log, na.rm = TRUE),
+                             allmag_day28 = rowMeans(dat_GMT_day28_log, na.rm = TRUE),
+                             allmag_day90 = rowMeans(dat_GMT_day90_log, na.rm = TRUE),
+                             allmag_day180 = rowMeans(dat_GMT_day180_log, na.rm = TRUE),
+                             Omicron_baseline = rowMeans(dat_GMT_baseline_log[,4:10], na.rm = TRUE)-rowMeans(dat_GMT_baseline_log[,1:3], na.rm = TRUE),
+                             Omicron_day7 = rowMeans(dat_GMT_day7_log[,4:9], na.rm = TRUE)-rowMeans(dat_GMT_day7_log[,1:3], na.rm = TRUE),
+                             Omicron_day14 = rowMeans(dat_GMT_day14_log[,4:10], na.rm = TRUE)-rowMeans(dat_GMT_day14_log[,1:3], na.rm = TRUE),
+                             Omicron_day28 = rowMeans(dat_GMT_day28_log[,4:9], na.rm = TRUE)-rowMeans(dat_GMT_day28_log[,1:3], na.rm = TRUE),
+                             Omicron_day90 = rowMeans(dat_GMT_day90_log[,4:10], na.rm = TRUE)-rowMeans(dat_GMT_day90_log[,1:3], na.rm = TRUE),
+                             Omicron_day180 = rowMeans(dat_GMT_day180_log[,4:9], na.rm = TRUE)-rowMeans(dat_GMT_day180_log[,1:3], na.rm = TRUE))
+
+Species_full <- read.table(file.path(input_dir, "Species_full.txt"), header = TRUE, row.names = 1)
+
+low.re.abundance.removal <- function(data,prevalence=0.1){
+  removal.taxa <- which(rowSums(data>0.01)/ncol(data) <= prevalence)
+  keep.taxa <- which(rowSums(data>0.01)/ncol(data) > prevalence)
+  data.gmb.filtered <- data[keep.taxa,]
+  return(list(data.gmb.filtered=data.gmb.filtered,
+              keep.taxa=keep.taxa,
+              removal.taxa=removal.taxa))
+}
+
+data.filtered <- low.re.abundance.removal(Species_full)
+Species_full2 <- data.frame(t(data.filtered$data.gmb.filtered))
+rowSums(Species_full2)
+
+length(data.filtered$keep.taxa)
+length(data.filtered$removal.taxa)
+
+intersect(dat_metadata_2$YN_ID, rownames(Species_full2))
+
+rownames(Species_full2) <- rownames(Species_full2) %>%
+  { ifelse(. %in% dat_metadata_2$YN_ID, dat_metadata_2$ID[match(., dat_metadata_2$YN_ID)], .) }
+
+min(Species_full2[!Species_full2 == 0])
+dat_gmb_log <- log(Species_full2 + 0.0000001)
+
+tax_gmb <- Species_full %>% rownames() %>% data.frame(X1 = .)
+tax_gmb2 <- tax_gmb %>%
+  tidyr::separate(X1,
+                  into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+                  sep = "\\|") %>%
+  mutate(species_name = sub("s__", "", species),
+         species_name = sub("_", " ", species_name))
+
+dat_path <- data.table::fread(file.path(input_dir, "pathabundance_integrate.tsv"))
+
+smarttable_pathway <- fread(file = pathway_classification_file)
+
+dat_path$Pathway_name <- sub(":.+$","",dat_path$ID)
+
+dat_path$feature <- stringr::str_replace_all(dat_path$Pathway_name,"-","_")
+dat_path$feature <- paste0("Path_",dat_path$feature)
+
+dat_path$Pathway <- sub("^.+: ","",dat_path$ID)
+
+Pathway_id_name <- dplyr::select(dat_path,c("feature","Pathway_name","Pathway"))
+
+dat_path <- select(dat_path,-c("ID", "Pathway","Pathway_name")) %>%
+  tibble::column_to_rownames(var = "feature")
+
+dat_path <- dat_path*100
+
+dat_path2 <- low.re.abundance.removal(dat_path)
+dat_path2 <- data.frame(t(dat_path2$data.gmb.filtered))
+colSums(t(dat_path2))
+
+length(low.re.abundance.removal(dat_path)$keep.taxa)
+length(low.re.abundance.removal(dat_path)$removal.taxa)
+
+rownames(dat_path2) <- rownames(dat_path2) %>%
+  { ifelse(. %in% dat_metadata_2$YN_ID, dat_metadata_2$ID[match(., dat_metadata_2$YN_ID)], .) }
+
+min(dat_path2[!dat_path2 == 0])
+dat_path_log <- log(dat_path2 + 0.0000001)
+
+ks.test(dat_path_log,"pnorm")
+shapiro.test(as.matrix(dat_path_log))
+cor.path <- cor(dat_path2, method = "spearman")
+sum(cor.path > 0.99 & cor.path < 1)
+
+high_cor_pairs <- which(cor.path > 0.85 & cor.path < 1, arr.ind = TRUE)
+low_abund_paths <- list()
+
+for (i in 1:nrow(high_cor_pairs)) {
+  path1 <- rownames(cor.path)[high_cor_pairs[i, 1]]
+  path2 <- colnames(cor.path)[high_cor_pairs[i, 2]]
+
+  if (sum(dat_path2[path1]) < sum(dat_path2[path2])) {
+    low_abund_paths[[path1]] <- TRUE
+  } else {
+    low_abund_paths[[path2]] <- TRUE
+  }
+}
+
+setdiff(colnames(dat_path2), names(low_abund_paths))
+
+length(high_abund_paths)
+dat_path2_ha <- dat_path2[setdiff(colnames(dat_path2), names(low_abund_paths))]
+intersect(colnames(dat_path2_ha), colnames(dat_path2))
+
+min(dat_path2_ha[!dat_path2_ha == 0])
+dat_path2_ha_log <- log(dat_path2_ha + 0.0000001)
+
+dist_matrix <- dist(t(dat_path2), method = "euclidean")
+hc <- hclust(dist_matrix, method = "average")
+
+clusters <- cutree(hc, h = 0.6)
+
+avg_abundance <- colMeans(dat_path2)
+
+selected_pathways <- tapply(
+  names(avg_abundance),
+  clusters,
+  function(x) names(which.max(avg_abundance[x]))
+)
+
+selected_pathways <- unlist(selected_pathways)
+cat("Selected features:", length(selected_pathways), "\n")
+
+dat_path2_clust <- dat_path2[, selected_pathways]
+min(dat_path2_clust[!dat_path2_clust == 0])
+dat_path2_clust_log <- log(dat_path2_clust + 0.0000001)
+
+pathab <- fread(file = file.path(input_dir, "pathabundance.tsv"))
+
+colnames(pathab) <- colnames(pathab) %>%
+  { ifelse(. %in% dat_metadata_2$YN_ID, dat_metadata_2$ID[match(., dat_metadata_2$YN_ID)], .) }
+
+colSums(pathab[,-1])
+
+rownames(dat_metadata_2) <- dat_metadata_2$ID
+dat_metadata_2 <- dat_metadata_2[rownames(Species_full2),]
+dat_metadata_2 <- as.data.frame(dat_metadata_2)
+rownames(dat_metadata_2) <- dat_metadata_2$ID
+
+rownames(dat_metadata_vaccine_recode) <- dat_metadata_vaccine_recode$ID
+dat_metadata_vaccine_recode <- dat_metadata_vaccine_recode[rownames(Species_full2),]
+
+dat_metadata_all <- dat_metadata_all %>% mutate(metag_sample = as.factor(ifelse(dat_metadata_all$ID %in% rownames(Species_full2),1,0)))
+dat_metadata_all <- dat_metadata_all[rownames(dat_GMT_day14_all),]
+dat_metadata_all <- as.data.frame(dat_metadata_all)
+rownames(dat_metadata_all) <- dat_metadata_all$ID
+
+dat_GMT_baseline <- dat_GMT_baseline[rownames(Species_full2),]
+dat_GMT_baseline_log <- dat_GMT_baseline_log[rownames(Species_full2),]
+dat_GMT_baseline_median <- dat_GMT_baseline_median[rownames(Species_full2),]
+
+dat_GMT_day7 <- dat_GMT_day7[rownames(Species_full2),]
+dat_GMT_day7_log <- dat_GMT_day7_log[rownames(Species_full2),]
+
+dat_GMT_day14 <- dat_GMT_day14[rownames(Species_full2),]
+dat_GMT_day14_log <- dat_GMT_day14_log[rownames(Species_full2),]
+dat_GMT_day14_median <- dat_GMT_day14_median[rownames(Species_full2),]
+
+dat_GMT_day28 <- dat_GMT_day28[rownames(Species_full2),]
+dat_GMT_day28_log <- dat_GMT_day28_log[rownames(Species_full2),]
+
+dat_GMT_day90 <- dat_GMT_day90[rownames(Species_full2),]
+dat_GMT_day90_log <- dat_GMT_day90_log[rownames(Species_full2),]
+
+dat_GMT_day180 <- dat_GMT_day180[rownames(Species_full2),]
+dat_GMT_day180_log <- dat_GMT_day180_log[rownames(Species_full2),]
+
+dat_cytokines_baseline <- dat_cytokines_baseline[rownames(Species_full2),]
+dat_cytokines_baseline_log <- dat_cytokines_baseline_log[rownames(Species_full2),]
+dat_cytokines_day1 <- dat_cytokines_day1[rownames(Species_full2),]
+dat_cytokines_day1_log <- dat_cytokines_day1_log[rownames(Species_full2),]
+
+dat_cytokines_baseline_median <- dat_cytokines_baseline_median[rownames(Species_full2),]
+dat_cytokines_day1_median <- dat_cytokines_day1_median[rownames(Species_full2),]
+
+dat_GMT_day14_quartiles <- dat_GMT_day14 %>%
+  mutate(across(where(is.numeric),
+                ~ cut(.x,
+                      breaks = quantile(.x, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE),
+                      labels = c("Q1", "Q2", "Q3", "Q4"),
+                      include.lowest = TRUE)))
+
+summary(dat_metadata_2)
+
+dat_metadata_2_day7 <- filter(dat_metadata_2, BTI_day7 == 0)
+dat_metadata_2_day14 <- filter(dat_metadata_2, BTI_day14 == 0)
+dat_metadata_2_day28 <- filter(dat_metadata_2, BTI_day28 == 0)
+dat_metadata_2_day90 <- filter(dat_metadata_2, BTI_day90 == 0)
+dat_metadata_2_day180 <- filter(dat_metadata_2, BTI_day180 == 0)
+
+dat_riggeline_gmt_0 <- filter(dat_GMT, ID %in% rownames(Species_full2) & Patch == "B1") %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               Group = factor(Group, levels = c("Vaccine_C", "Vaccine_B", "Vaccine_A")),
+                                               SARS.CoV.2 = factor(SARS.CoV.2, levels = colnames(dat_GMT_day14)))
+
+dat_riggeline_gmt_7 <- filter(dat_GMT, ID %in% rownames(Species_full2) & Patch == "B3") %>%
+  mutate(`SARS-CoV-2` = ifelse(`SARS-CoV-2` == "CH.1.1", "JN.1", `SARS-CoV-2`)) %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               Levels = ifelse(SARS.CoV.2 == "JN.1", NA, Levels),
+                                               Group = factor(Group, levels = c("Vaccine_C", "Vaccine_B", "Vaccine_A")),
+                                               SARS.CoV.2 = factor(SARS.CoV.2, levels = colnames(dat_GMT_day14)))
+
+dat_riggeline_gmt_14 <- filter(dat_GMT, ID %in% rownames(Species_full2) & Patch == "B4") %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               Group = factor(Group, levels = c("Vaccine_C", "Vaccine_B", "Vaccine_A")),
+                                               SARS.CoV.2 = (factor(SARS.CoV.2, levels = colnames(dat_GMT_day14))))
+
+dat_riggeline_gmt_28 <- filter(dat_GMT, ID %in% rownames(Species_full2) & Patch == "B5") %>%
+  mutate(`SARS-CoV-2` = ifelse(`SARS-CoV-2` == "CH.1.1", "JN.1", `SARS-CoV-2`)) %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               Levels = ifelse(SARS.CoV.2 == "JN.1", NA, Levels),
+                                               Group = factor(Group, levels = c("Vaccine_C", "Vaccine_B", "Vaccine_A")),
+                                               SARS.CoV.2 = factor(SARS.CoV.2, levels = colnames(dat_GMT_day14)))
+
+dat_riggeline_gmt_90 <- filter(dat_GMT, ID %in% rownames(Species_full2) & Patch == "B6") %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               Group = factor(Group, levels = c("Vaccine_C", "Vaccine_B", "Vaccine_A")),
+                                               SARS.CoV.2 = (factor(SARS.CoV.2, levels = colnames(dat_GMT_day14))))
+
+dat_riggeline_gmt_180 <- filter(dat_GMT, ID %in% rownames(Species_full2) & Patch == "B7") %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               Group = factor(Group, levels = c("Vaccine_C", "Vaccine_B", "Vaccine_A")),
+                                               SARS.CoV.2 = (factor(SARS.CoV.2, levels = colnames(dat_GMT_day14))))
+
+variant_colors <- rev(c(
+  "Prototype" = "#69C3B1",
+  "Alpha" = "#C78AF9",
+  "Beta" = "#63A4EF",
+  "BA.4_5" = "#4E8A51",
+  "BF.7" = "#8E53F8",
+  "XBB.1.5" = "#D64E34",
+  "XBB.1.16" = "#ED7D87",
+  "XBB.1.9.1" = "#DBC44A",
+  "BQ.1.1" = "#2ca02c",
+  "JN.1" = "#4877B0"
+))
+
+variant_colors <- rev(c("#98D6CB", "#e4e4a7", "#C3C0DE", "#FA8C7F", "#8CB8D6",  "#FCBB70", "#BAE178", "#FBD2E7","#DDDDDD", "#C28CC2"))
+
+list_ridge_gmt <- list()
+
+plot_ridgeline <- function(dat_plot){
+  (ggplot(dat_plot, aes(x = Levels, y = SARS.CoV.2, fill = SARS.CoV.2)) +
+
+     geom_density_ridges(
+      na.rm = T,
+       alpha = 0.9,
+       scale = 1.5,
+       rel_min_height = 0.01
+
+     ) +
+
+     scale_fill_manual(values = variant_colors) +
+
+     scale_x_continuous(
+       expand = c(0, 0)
+     ) +
+
+     labs(
+
+       x = "Log(GMT Day 14)",
+       y = "SARS-CoV-2 Variants"
+
+     ) +
+
+     theme_classic(base_size = 12) +
+     theme(
+       legend.position = "none",
+
+       axis.text.x = element_blank(),
+       axis.text.y = element_text(color = "black", face = "bold"),
+       axis.line = element_line(color = "black"),
+       axis.ticks = element_line(color = "black"),
+
+       axis.title.x = element_blank(),
+       axis.title.y = element_text(face = "bold", size = 12),
+       axis.text = element_text(size = 10),
+
+       panel.grid.major.y = element_line(),
+       panel.border = element_rect(color = "black", size = .5, fill = NA),
+
+     ))
+}
+(list_ridge_gmt[[1]] <- plot_ridgeline(dat_riggeline_gmt_0))
+(list_ridge_gmt[[2]] <- plot_ridgeline(dat_riggeline_gmt_7))
+list_ridge_gmt[[3]] <- plot_ridgeline(dat_riggeline_gmt_14)
+(list_ridge_gmt[[4]] <- plot_ridgeline(dat_riggeline_gmt_28))
+(list_ridge_gmt[[5]] <- plot_ridgeline(dat_riggeline_gmt_90))
+list_ridge_gmt[[6]] <- plot_ridgeline(dat_riggeline_gmt_180)
+
+(plot_ridgeline_gmt <- wrap_plots(list_ridge_gmt) + plot_layout(nrow = 1, guides = "collect"))
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_ridgeline_gmt.pdf"),
+                plot_ridgeline_gmt,width = 24,height = 12,units = "cm")
+
+plot_box_ridgeline <- function(dat_plot, dat_ridgeline_plot, xlabel, xmin = 0.9, ylabel = element_blank()){
+  (plot_box_gmt  <- ggplot(dat_plot, aes(x = Levels, y = SARS.CoV.2, color = Group)) +
+     geom_boxplot(
+       orientation = "y",
+       position = position_dodge2(width = 0.6,
+                                  preserve = "single",
+
+                                  reverse = T),
+       width = 0.6,
+       size = 0.8,
+       outlier.alpha = 0.6, outlier.size = .7
+     ) +
+     scale_x_continuous(
+       expand = c(0, 0)
+     ) +
+     xlab(xlabel) +
+     ylab("SARS-CoV-2 Variants")+
+     labs(color = "Vaccine type")+
+     scale_color_manual(values = c("Vaccine_A" = "#0073BD", "Vaccine_B" = "#24A535", "Vaccine_C" = "#9F6CB4"))+
+     theme_classic() +
+     theme(
+       axis.text.y = element_text(face = "bold",color = "black",size = 10),
+       axis.text.x = element_text(face = "bold",color = "black",size = 10),
+       axis.title.y = element_text(face = "bold", size = 12),
+       axis.title.x = element_text(face = "bold",color = "black",size = 10),
+       panel.background = element_blank(),
+       panel.grid.major = element_line(color = "gray90"),
+       panel.border = element_rect(color = "black", size = .5, fill = NA),
+       legend.title = element_text(color = "black", face = "bold", size = 10),
+       legend.position = "right")
+  )
+
+  x_rng <- c(min(na.omit(dat_plot)$Levels) * xmin, max(na.omit(dat_plot)$Levels) * 1.1)
+  x_rng <- c(2,12)
+  x_breaks <- pretty(x_rng, n = 4)
+
+  (p_main <- wrap_plots(dat_ridgeline_plot, plot_box_gmt) +
+      plot_layout(nrow = 2, guides = "collect") &
+      scale_x_continuous(limits = x_rng, breaks = x_breaks, expand = c(0, 0)) &
+      theme(axis.title.y = ylabel,
+            plot.margin = unit(c(0, 0, 0.2, 0.1), "cm")))
+
+  return(p_main)
+}
+
+(gmt_value_plot_0 <- plot_box_ridgeline(dat_riggeline_gmt_0, list_ridge_gmt[[1]], "Log(GMT Baseline)", 0.5, element_text(face = "bold", size = 12)) +
+    theme(legend.position = "none"))
+(gmt_value_plot_7 <- plot_box_ridgeline(dat_riggeline_gmt_7, list_ridge_gmt[[2]], "Log(GMT Day 7)") +
+    theme(legend.position = "none"))
+(gmt_value_plot_14 <- plot_box_ridgeline(dat_riggeline_gmt_14, list_ridge_gmt[[3]], "Log(GMT Day 14)"))
+(gmt_value_plot_28 <- plot_box_ridgeline(dat_riggeline_gmt_28, list_ridge_gmt[[4]], "Log(GMT Day 28)"))
+(gmt_value_plot_90 <- plot_box_ridgeline(dat_riggeline_gmt_90, list_ridge_gmt[[5]], "Log(GMT Day 90)"))
+(gmt_value_plot_180 <- plot_box_ridgeline(dat_riggeline_gmt_180, list_ridge_gmt[[6]], "Log(GMT Day 180)"))
+
+(plot_gmt <- wrap_plots(list(gmt_value_plot_0, gmt_value_plot_7, gmt_value_plot_14,
+                             gmt_value_plot_28, gmt_value_plot_90, gmt_value_plot_180)) +
+  plot_layout(nrow = 1,
+              guides = "collect",
+  ) &
+  theme(legend.position = "none",
+
+        plot.margin = unit(c(0.2, 0.2, 0.2, 0.2), "cm")))
+
+(plot_gmt_2 <- wrap_plots(list(gmt_value_plot_0, gmt_value_plot_7, gmt_value_plot_14,
+                             gmt_value_plot_28, gmt_value_plot_90, gmt_value_plot_180)) +
+    plot_layout(nrow = 1,
+                guides = "collect",
+    ) &
+    theme(legend.position = "none",
+
+          plot.margin = unit(c(0.2, 0.2, 0.2, 0.2), "cm")))
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_gmt.pdf"),
+                plot_gmt,width = 50,height = 25,units = "cm")
+
+box_gmt <- function(dat, group){
+
+  plot <- ggplot(dat, aes(x = SARS.CoV.2, y = Levels, color = SARS.CoV.2)) +
+    geom_boxplot(
+      width = 0.5,
+      size = .8,
+      alpha = 1,
+
+    ) +
+
+    geom_jitter(
+      aes(color = SARS.CoV.2),
+      width = 0.1,
+      size = .5,
+      alpha = 0.1
+    ) +
+
+    scale_y_continuous(trans = "sqrt",
+                       breaks = c(0, 2000, 10000, 40000, 100000),
+                       limits = c(0, 100000),
+                       labels = label_number(accuracy = 1)) +
+    labs(
+      title = "",
+      x = "Neutralizing antibodies",
+      y = "Sqrt(GMT Levels)"
+    ) +
+    scale_color_manual(values = c("#98D6CB", "#e4e4a7", "#C3C0DE", "#FA8C7F", "#8CB8D6",  "#FCBB70", "#BAE178", "#FBD2E7","#DDDDDD", "#C28CC2"))+
+
+    theme_classic() +
+    theme(plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 12
+
+    ),
+    axis.text.y = element_text(face = "bold",color = "black",size = 10),
+    axis.text.x = element_text(face = "bold",color = "black",size = 10, angle = 45, hjust = 1),
+    axis.title.y = element_text(face = "bold",color = "black",size = 10),
+    axis.title.x = element_text(face = "bold",color = "black",size = 10),
+    panel.background = element_blank(),
+    panel.border = element_rect(color = "black", size = .5, fill = NA),
+    legend.position = "none")
+  return(plot)
+}
+
+boxlpot_gmt <- list(box_gmt(dat_riggeline_gmt_0, "Baseline"),
+                    box_gmt(filter(dat_riggeline_gmt_7, SARS.CoV.2 != "CH.1.1"), "Day 7"),
+                    box_gmt(dat_riggeline_gmt_14, "Day 14"))
+
+(plot_ridgeline_gmt <- wrap_plots(boxlpot_gmt) + plot_layout(nrow = 1, guides = "collect"))
+
+boxlpot_gmt_14 <- list(box_gmt(filter(dat_riggeline_gmt_14, Group == "Vaccine_A"), "Vaccine_A"),
+     box_gmt(filter(dat_riggeline_gmt_14, Group == "Vaccine_B"), "Vaccine_B"),
+     box_gmt(filter(dat_riggeline_gmt_14, Group == "Vaccine_C"), "Vaccine_C"))
+
+(wrap_plots(boxlpot_gmt_14) + plot_layout(nrow = 1, guides = "collect"))
+
+dat_box_gmt_0 <- filter(dat_GMT, ID %in% rownames(Species_full2) & Patch == "B1") %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               SARS.CoV.2 = factor(SARS.CoV.2, levels = colnames(dat_GMT_day14)))
+
+dat_box_gmt_7 <- filter(dat_GMT, ID %in% dat_metadata_2_day7$ID  & Patch == "B3") %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               SARS.CoV.2 = factor(SARS.CoV.2, levels =
+                                                                     c("Prototype", "Alpha", "Beta", "BA.4_5", "BF.7", "XBB.1.5", "XBB.1.16", "XBB.1.9.1", "BQ.1.1", "CH.1.1")))
+
+dat_box_gmt_14 <- filter(dat_GMT, ID %in% dat_metadata_2_day14$ID & Patch == "B4") %>%
+  rename(SARS.CoV.2 = `SARS-CoV-2`) %>% mutate(SARS.CoV.2 = ifelse(SARS.CoV.2 == "BA.4/5", "BA.4_5", SARS.CoV.2),
+                                               Levels = log(Levels),
+                                               SARS.CoV.2 = factor(SARS.CoV.2, levels = colnames(dat_GMT_day14)))
+
+subgroup_gmt_plot <- function(dat){
+
+  plot_subgroup_gmt_list <- list()
+
+  for (antibody in  levels(dat$SARS.CoV.2)) {
+
+    subset_data <- dat[dat$SARS.CoV.2 == antibody, ]
+
+    stat_test <- subset_data %>%
+      kruskal_test(Levels ~ Group) %>%
+      add_xy_position(x = "Group")  %>%
+      mutate(p.adj.signif = case_when(p.adj < 0.05 ~ "***",
+                                      p.adj < 0.1 ~ "***",
+                                      p.adj < 0.2 ~ "*",
+                                      TRUE ~ ""
+      )) %>%
+      filter(p.adj < 0.2)
+
+    p <- ggplot(subset_data, aes(x = Group, y = Levels, color = Group)) +
+      geom_boxplot(
+        width = 0.5,
+        size = 1,
+        alpha = 1,
+        outlier.color = "grey95"
+      ) +
+      stat_pvalue_manual(
+        stat_test,
+        label = "p.adj.signif",
+        tip.length = 0.01,
+        step.increase = 0.1
+      ) +
+      geom_jitter(
+        aes(color = Group),
+        width = 0.1,
+        size = 1,
+        alpha = 0.5
+      ) +
+      scale_color_manual(values = c("#0073BD", "#24A535", "#9F6CB4"))+
+      labs(title = "", x = "Group", y = "Log(GMT day 14)") +
+      theme_classic() +
+      theme(plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 12
+      ),
+      axis.text.y = element_text(face = "bold",color = "black",size = 10),
+      axis.text.x = element_text(face = "bold",color = "black",size = 10, angle = 45, hjust = 1),
+      axis.title.y = element_text(face = "bold",color = "black",size = 10),
+      axis.title.x = element_blank(),
+      legend.position = "none")
+
+    plot_subgroup_gmt_list[[antibody]] <- p
+  }
+
+  (plot <- wrap_plots(plot_subgroup_gmt_list) + plot_layout(nrow = 2, guides = "collect"))
+  return(plot)
+}
+
+subgroup_gmt_plot(dat_box_gmt_0)
+subgroup_gmt_plot(dat_box_gmt_7)
+subgroup_gmt_plot(dat_box_gmt_14)
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_subgroup_day14_gmt.pdf"),
+                subgroup_gmt_plot(dat_box_gmt_14), width = 25,height = 14,units = "cm")
+
+dat_box_gmt_all <- rbind(dat_box_gmt_0, dat_box_gmt_7, dat_box_gmt_14)
+
+subtime_gmt_plot <- function(dat){
+
+  color_value <- c("#98D6CB", "#e4e4a7", "#C3C0DE", "#FA8C7F", "#8CB8D6",  "#FCBB70", "#BAE178", "#FBD2E7","#DDDDDD", "#C28CC2")
+  i = 1
+
+  plot_subgroup_gmt_list <- list()
+
+  name_antibody <- c("Prototype", "Alpha", "Beta", "BA.4_5", "BF.7", "XBB.1.5", "XBB.1.16", "XBB.1.9.1", "BQ.1.1")
+
+  for (antibody in  name_antibody) {
+
+    color <- color_value[i]
+    i=i+1
+
+    print(antibody)
+
+    subset_data <- dat[dat$SARS.CoV.2 == antibody, ]
+
+    stat_test <- subset_data %>%
+      wilcox_test(Levels ~ Patch) %>%
+      add_xy_position(x = "Patch") %>%
+      mutate(p.adj.signif = case_when(p.adj < 0.05 ~ "***",
+                                      p.adj < 0.1 ~ "***",
+                                      p.adj < 0.2 ~ "*",
+                                      TRUE ~ ""
+      )) %>%
+      filter(p.adj < 0.2)
+
+    p <- ggplot(subset_data, aes(x = Patch, y = Levels, color = Patch)) +
+      geom_boxplot(
+        width = 0.6,
+        size = 0.9,
+
+        outlier.color = "grey95"
+      ) +
+      geom_jitter(
+
+        width = 0.15,
+        size = 0.4
+
+      ) +
+      stat_pvalue_manual(
+        stat_test,
+        label = "p.adj.signif",
+        tip.length = 0.01,
+        hide.ns = TRUE,
+        step.increase = 0.1
+      ) +
+      scale_x_discrete(
+        labels = c("B1" = "Baseline", "B3" = "Day 7", "B4" = "Day 14")
+      ) +
+
+      scale_y_continuous(limits = c(NA, max(subset_data$Levels, na.rm = TRUE) * 1.3)) +
+      scale_color_manual(values = c(alpha(color, .4),
+                                    alpha(color, .7),
+                                    alpha(color, 1))) +
+      scale_fill_manual(values = c(alpha(color, .1),
+                                   alpha(color, .3),
+                                   alpha(color, .5))) +
+
+      labs(title = antibody, x = "Patch", y = "Log(GMT)") +
+      theme_classic() +
+      theme(plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 12
+      ),
+      axis.text.y = element_text(face = "bold",color = "black",size = 10),
+      axis.text.x = element_text(face = "bold",color = "black",size = 10, angle = 45, hjust = 1),
+      axis.title.y = element_text(face = "bold",color = "black",size = 10),
+      axis.title.x = element_blank(),
+      legend.position = "none")
+
+    plot_subgroup_gmt_list[[antibody]] <- p
+  }
+
+  print("JN.1")
+  subset_data <- dat[dat$SARS.CoV.2 == "JN.1", ]
+
+  stat_test <- subset_data %>%
+    wilcox_test(Levels ~ Patch) %>%
+    add_xy_position(x = "Patch") %>%
+    mutate(p.signif = case_when(p < 0.05 ~ "***",
+                                p < 0.1 ~ "***",
+                                p < 0.2 ~ "*",
+                                TRUE ~ ""
+                                ))
+
+  p <- ggplot(subset_data, aes(x = Patch, y = Levels, color = Patch)) +
+    geom_boxplot(
+      width = 0.6,
+      size = 0.9,
+
+      outlier.color = "grey95"
+    ) +
+    stat_pvalue_manual(
+      stat_test,
+      label = "p.signif",
+      tip.length = 0.01,
+      hide.ns = TRUE,
+      step.increase = 0.1
+    ) +
+    geom_jitter(
+
+      width = 0.15,
+      size = 0.4
+
+    ) +
+    scale_x_discrete(
+      labels = c("B1" = "Baseline", "B3" = "Day 7", "B4" = "Day 14")
+    ) +
+
+    scale_y_continuous(limits = c(NA, max(subset_data$Levels, na.rm = TRUE) * 1.3)) +
+    scale_color_manual(values = c(alpha(color_value[10], .4),
+                                  alpha(color_value[10], 1))) +
+    scale_fill_manual(values = c(alpha(color_value[10], .1),
+                                 alpha(color_value[10], .5))) +
+
+    labs(title = "JN.1", x = "Patch", y = "Log(GMT)") +
+    theme_classic() +
+    theme(plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 12
+    ),
+    axis.text.y = element_text(face = "bold",color = "black",size = 10),
+    axis.text.x = element_text(face = "bold",color = "black",size = 10, angle = 45, hjust = 1),
+    axis.title.y = element_text(face = "bold",color = "black",size = 10),
+    axis.title.x = element_blank(),
+    legend.position = "none")
+
+  plot_subgroup_gmt_list[["JN.1"]] <- p
+
+  (plot <- wrap_plots(plot_subgroup_gmt_list) + plot_layout(nrow = 2, guides = "collect"))
+  return(plot)
+}
+
+subtime_gmt_plot(dat_box_gmt_all)
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_time_gmt.pdf"),
+                subtime_gmt_plot(dat_box_gmt_all), width = 25,height = 14,units = "cm")
+
+dist_matrix <- dist(t(dat_GMT_day14), method = "euclidean")
+hc <- hclust(dist_matrix, method = "average")
+
+clusters <- cutree(hc, h = 0.6)
+
+avg_abundance <- colMeans(dat_GMT_day14)
+
+selected_gmt <- tapply(
+  names(avg_abundance),
+  clusters,
+  function(x) names(which.max(avg_abundance[x]))
+)
+
+selected_gmt <- unlist(selected_gmt)
+cat("Selected features:", length(selected_gmt), "\n")
+
+dat_GMT_day14_clust <- dat_GMT_day14[, selected_gmt]
+
+dat_ck_view <- data.frame(median_value = colMedians(as.matrix(dat_cytokines_day1_log))) %>%
+  mutate(ID = rownames(.),
+         ID = sub("_", "-", ID)) %>%
+  merge(., type_cytokines, by.x = "ID", by.y = "Names_rf", all.y = T) %>%
+  group_by(Type) %>%
+  slice_max(order_by = median_value, n = 1)
+
+dat_ck_view_2 <- dplyr::select(
+  dat_cytokines_day1_log,
+  dplyr::all_of(sub("-", "_", dat_ck_view$ID))
+) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "ID",
+    values_to = "value"
+  ) %>%
+  mutate(ID = sub("_", "-", ID)) %>%
+  merge(., dat_ck_view, by = "ID", all.x = T)
+
+(ggplot(dat_ck_view_2, aes(x = value, y = ID, fill = Type)) +
+
+    geom_density_ridges(
+      na.rm = T,
+      alpha = 0.9,
+      scale = 1.5,
+      rel_min_height = 0.01
+
+    ) +
+
+    scale_x_continuous(
+      expand = c(0, 0)
+    ) +
+
+    labs(
+
+      x = "Log(GMT Day 14)",
+      y = "SARS-CoV-2 Variants"
+
+    ) +
+
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "none",
+
+      axis.text.x = element_text(color = "black", face = "bold"),
+
+      axis.text.y = element_text(color = "black", face = "bold"),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.title.x = element_text(face = "bold", size = 12),
+
+      axis.title.y = element_text(face = "bold", size = 12),
+      axis.text = element_text(size = 10),
+
+      panel.grid.major.y = element_line(),
+      panel.border = element_rect(color = "black", size = .5, fill = NA),
+
+    ))
+
+type_cytokines_all
+
+df_ck_long_all <- dat_cytokines_day1_log %>%
+
+  rownames_to_column("Sample") %>%
+  pivot_longer(
+    cols = -Sample,
+    names_to = "metadata",
+    values_to = "Value"
+  ) %>%
+
+  merge(., type_cytokines_all, by.x = "metadata", by.y = "Names_rf", all.x = T) %>%
+  mutate(,
+         Type = factor(Type, levels = rev(c("Chemokines", "Cytokines","Cytokine Receptors", "Immunomarkers",
+                                                "Adhesion Molecules", "Enzymes", "Hormones", "Growth Factors")))
+         )
+
+Cytokines_all_name <- df_ck_long_all %>%
+  group_by(Names, Type) %>%
+  summarise(Value_median = median(Value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Value_median)) %>%
+  slice_head(n = 25) %>%
+  arrange(Type, Value_median) %>%
+  mutate(Names = factor(Names, levels = Names))
+
+df_ck_long_all <- df_ck_long_all %>%
+  filter(Names %in% Cytokines_all_name$Names) %>%
+  mutate(Names = factor(Names, levels = Cytokines_all_name$Names))
+
+(plot_ab_ck_all <- ggplot(df_ck_long_all, aes(x = Names,
+                                      color = Type,
+                                      y = Value)) +
+    stat_summary(
+      fun = median,
+      geom = "point",
+      shape = 17,
+      size = 4
+    ) +
+
+    scale_color_manual(values = rev(c("#D7E69A", "#FAF299", "#FAF299", "#D79CBB","#FAA69A", "#60A199","#9D8292","#A8A2C4")),
+
+                       name = "Immune Mediators Type") +
+    guides(color = guide_legend(reverse = TRUE)) +
+    coord_flip(clip = "off") +
+
+    theme_classic()+
+    theme(
+      axis.text.x = element_text(color = "black", face = "bold", size = 10),
+      axis.title.x = element_text(face = "bold", size = 12),
+      axis.title.y = element_text(face = "bold", size = 12),
+
+      axis.text.y = element_text(color = "black", face = "bold", size = 10),
+
+      legend.position = "right",
+
+      panel.grid.major = element_line(color = "gray90"),
+      panel.background = element_blank(),
+      panel.border = element_rect(color = "black", size = .5, fill = NA),
+    ) +
+    labs(x = "Immune Mediators Day 1", y = "Median Log(levels)")+
+    guides(
+      fill = guide_legend(
+        override.aes = list(shape = 21, color = "black", size = 4)
+      )
+    )
+)
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_ab_ck_all.pdf"),
+                plot_ab_ck_all, width = 12,height = 22,units = "cm")
+
+dat_tableone <- dat_GMT_day14
+
+dat_tableone <- cbind(dat_metadata_2, dat_tableone)
+summary(dat_tableone)
+
+vars_use <- c("Gender", "Age", "BMI",
+
+              "Prototype_day14", "Alpha_day14", "Beta_day14", "BA.4_5_day14","BF.7_day14",
+              "XBB.1.5_day14", "XBB.1.16_day14", "XBB.1.9.1_day14", "BQ.1.1_day14", "JN.1_day14",
+              "pain", "swelling", "acute.allergic.reaction", "vomitting", "jonit.pain", "Muscular.pain", "headache", "cold", "fatigue", "fever")
+
+factor_vars <- c("Gender",
+
+                 "pain", "swelling", "acute.allergic.reaction", "vomitting", "jonit.pain", "Muscular.pain", "headache", "cold", "fatigue", "fever")
+
+cont_vars <- setdiff(vars_use, factor_vars)
+
+tab1_012 <- CreateTableOne(vars = vars_use,
+                           strata = "Vaccination",
+                           data = dat_tableone,
+                           factorVars = factor_vars,
+                           addOverall = F)
+
+tab2m_012 <- print(tab1_012,
+                   showAllLevels = F,
+                   nonnormal = cont_vars,
+                   formatOptions = list(big.mark = ","))
+
+write.csv(tab2m_012, file=file.path(output_dir, "Base_information", "Table one_2.csv"))
+
+dat_tableone_all <- dat_GMT_day14_all
+dat_tableone_all <- cbind(dat_metadata_all, dat_tableone_all)
+summary(dat_tableone_all)
+
+dat_tableone_all <- dat_tableone_all %>% mutate(., metag_sample = "2") %>% rbind(dat_tableone_all, .)
+
+vars_use_2 <- c("Gender", "Age", "BMI",
+
+              "Prototype_day14", "Alpha_day14", "Beta_day14", "BA.4_5_day14","BF.7_day14",
+              "XBB.1.5_day14", "XBB.1.16_day14", "XBB.1.9.1_day14", "BQ.1.1_day14", "JN.1_day14")
+factor_vars_2 <- c("Gender"
+
+)
+
+tab1_all <- CreateTableOne(vars = c(vars_use_2, "Vaccination"),
+               strata = "metag_sample",
+               data = dat_tableone_all,
+               factorVars = c(factor_vars_2, "Vaccination"),
+               addOverall = TRUE)
+
+tab2_all <- print(tab1_all,
+                   showAllLevels = F,
+                   nonnormal = cont_vars,
+                  contDigits = 1,
+                  catDigits = 1,
+                  pDigits = 3,
+                  printToggle = T,
+                  noSpaces = TRUE,
+                   formatOptions = list(digits = 1))
+
+tab2_all_df <- data.frame(Variable = rownames(tab2_all), tab2_all)
+rownames(tab2_all_df) <- NULL
+
+ft <- flextable(tab2_all_df)
+ft <- align(ft, align = "left", part = "all")
+ft
+
+doc <- read_docx()
+doc <- body_add_par(doc, "Table 1. Baseline characteristics", style = "Normal")
+doc <- body_add_flextable(doc, ft)
+
+print(doc, target = file.path(output_dir, "Base_information", "Table one all sample.docx"))
+
+write.csv(tab2_all, file=file.path(output_dir, "Base_information", "Table one all sample.csv"))
+
+vars_use_3 <- c("Gender", "Age", "BMI",
+
+                "Prototype_day14", "Alpha_day14", "Beta_day14", "BA.4_5_day14","BF.7_day14",
+                "XBB.1.5_day14", "XBB.1.16_day14", "XBB.1.9.1_day14", "BQ.1.1_day14", "JN.1_day14",
+                "pain", "swelling", "acute.allergic.reaction", "vomitting", "jonit.pain", "Muscular.pain", "headache", "cold", "fatigue", "fever")
+
+factor_vars_3 <- c("Gender",
+
+                   "pain", "swelling", "acute.allergic.reaction", "vomitting", "jonit.pain", "Muscular.pain", "headache", "cold", "fatigue", "fever")
+
+tab1_vaccine <- CreateTableOne(vars = vars_use_3,
+                           strata = "Vaccination",
+                           data = dat_tableone,
+                           factorVars = factor_vars_3,
+                           addOverall = TRUE)
+
+tab2_vaccine <- print(tab1_vaccine,
+                  showAllLevels = F,
+                  nonnormal = cont_vars,
+                  contDigits = 1,
+                  catDigits = 1,
+                  pDigits = 3,
+                  printToggle = T,
+                  noSpaces = TRUE,
+                  formatOptions = list(digits = 1))
+
+tab2_vaccine_df <- data.frame(Variable = rownames(tab2_vaccine), tab2_vaccine)
+rownames(tab2_vaccine_df) <- NULL
+
+ft_vaccine <- flextable(tab2_vaccine_df)
+ft_vaccine <- align(ft_vaccine, align = "left", part = "all")
+ft_vaccine
+
+doc_vaccine <- read_docx()
+doc_vaccine <- body_add_par(doc_vaccine, "Table 2", style = "Normal")
+doc_vaccine <- body_add_flextable(doc_vaccine, ft_vaccine)
+
+print(doc_vaccine, target = file.path(output_dir, "Base_information", "Table one vaccine.docx"))
+
+rowSums(Species_full2)
+df_gmb_long <- Species_full2
+rownames(df_gmb_long) <- NULL
+
+df_gmb_long <- df_gmb_long %>%
+  tibble::rownames_to_column(., var = "SampleID") %>%
+  pivot_longer(
+    cols = -SampleID,
+    names_to = "Taxa_Name",
+    values_to = "Abundance"
+  )
+
+top_taxa <- df_gmb_long %>%
+  group_by(Taxa_Name) %>%
+  summarise(total_abundance = sum(Abundance)) %>%
+  arrange(desc(total_abundance)) %>%
+  slice(1:20) %>%
+  pull(Taxa_Name)
+
+df_gmb_long <- df_gmb_long %>%
+  mutate(Taxa_Name = ifelse(Taxa_Name %in% top_taxa, Taxa_Name, "Other"))
+
+df_gmb_long <- df_gmb_long %>%
+  group_by(SampleID) %>%
+  mutate(Abundance = Abundance / sum(Abundance)) %>%
+  ungroup()
+
+df_gmb_long$SampleID <- as.numeric(df_gmb_long$SampleID)
+
+print(ggplot(df_gmb_long, aes(x = SampleID, y = Abundance, fill = Taxa_Name)) +
+  geom_area() +
+
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",
+    axis.ticks = element_blank()
+  ) +
+  labs(x = "Sample", y = "Relative Abundance", fill = "Taxa"))
+
+summary(dat_metadata_2)
+dat_clinical_metadata <- dat_metadata_2
+dat_clinical_metadata <- dat_clinical_metadata[levels(Genus_dat$ID),]
+range(dat_clinical_metadata$Age)
+range(dat_clinical_metadata$BMI)
+
+ht_list <- HeatmapAnnotation(`Gender` = dat_clinical_metadata$Gender,
+                             `Age` = dat_clinical_metadata$Age,
+                             `BMI` = dat_clinical_metadata$BMI,
+                             show_annotation_name = FALSE,
+                             col = list(`Gender` = c(`Female` = "#91C7BA", Male = "#CDB87D"),
+                                        `Age` = circlize::colorRamp2(breaks = c(21,51), colors = c("white", "#2F386E")),
+                                        `BMI` = circlize::colorRamp2(breaks = c(16,33), colors = c("white", "#602585"))
+                             )
+) %v%
+NULL
+ht_list <- ht_list %>% draw(., heatmap_legend_side = "bottom")
+
+pdf(file = file.path(output_dir, "Base_information", "deomographics_heatmap.pdf"),
+    width = 8, height = 6)
+ht_list
+dev.off()
+
+pdf(file = NULL)
+draw(ht_list)
+grid_plot_ht_list <- grid.grab()
+dev.off()
+
+plot_htmetadata_genus <- as_ggplot(grid_plot_ht_list) / genus_p
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_htmetadata_genus.pdf"),
+                plot_htmetadata_genus,width = 14,height = 18,units = "cm")
+
+select(dat_metadata_2, ID, Vaccination, pain:fever) %>% mutate(across(Vaccination:fever, as.factor)) %>% summary()
+
+dat_ar_long <- select(dat_metadata_2, ID, Vaccination, pain:fever) %>%
+  gather(key = `Adverse Reaction`, value = value, pain:fever) %>%
+
+  group_by(Vaccination, `Adverse Reaction`, value) %>%
+  summarise(count = n(), .groups = "drop") %>%
+
+  complete(Vaccination, `Adverse Reaction`, value = 0:3, fill = list(count = 0)) %>%
+  mutate(`Adverse Reaction` = factor(`Adverse Reaction`, levels = colnames(select(dat_metadata_2, pain:fever))),
+         value = recode(value, `1` = "Grade 1",
+         `2` = "Grade 2",
+         `3` = "Grade 3")) %>%
+  na.omit() %>%
+
+  arrange(Vaccination, `Adverse Reaction`, value)
+
+dat_ar_long <- dat_ar_long %>%
+  mutate(
+    group_id = as.numeric(`Adverse Reaction`),
+    vac_id   = as.numeric(Vaccination),
+    x_id     = (group_id - 1) * 3 + vac_id,
+    x_label  = as.character(Vaccination)
+  ) %>%
+  mutate(sample_size = case_when(Vaccination == "Vaccine_A" ~ 80,
+                                 Vaccination == "Vaccine_B" ~ 65,
+                                 Vaccination == "Vaccine_C" ~ 70)
+  )
+
+dat_ar_pos <- dat_ar_long %>%
+  distinct(`Adverse Reaction`, group_id) %>%
+  mutate(
+    x_min = (group_id - 1) * 3 + 0.52,
+    x_max =  group_id      * 3 + 0.48,
+    x_mid = (x_min + x_max) / 2,
+    color_type = c("Local Adverse Reactions", "Local Adverse Reactions", rep("Systemic Adverse Reactions", 8))
+  ) %>%
+  mutate(`Adverse Reaction` = recode(`Adverse Reaction`,
+    pain = "Pain",
+    swelling = "Swelling",
+    acute.allergic.reaction = "Acute allergic \n reaction",
+    vomitting = "Vomiting",
+    jonit.pain = "Joint pain",
+    Muscular.pain = "Muscular pain",
+    headache = "Headache",
+    cold = "Cold",
+    fatigue = "Fatigue",
+    fever = "Fever"
+  ))
+
+(plot_ar_info <- ggplot(dat_ar_long,
+            aes(x = factor(x_id),
+                y = count / sample_size,
+                fill = value)) +
+  geom_col(width = 0.7, colour = NA) +
+
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+
+    expand = expansion(mult = c(0, 0))
+  ) +
+
+  scale_x_discrete(labels = rep(c("Vaccine_A", "Vaccine_B", "Vaccine_C"), 10)) +
+
+  labs(x = NULL, y = "Percentage", fill = NULL) +
+  theme_classic2() +
+  theme(
+    panel.grid.major.x = element_blank(),
+
+    panel.grid.minor   = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, color = "black", size = 10),
+    axis.text.y = element_text(size = 10, colour = "black"),
+    axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.justification = "center",
+    plot.margin = unit(c(2, 1, 2, 1), "cm"),
+    panel.background = element_rect(fill = "white", colour = NA)
+  )  +
+
+  coord_cartesian(clip = "off", ylim = c(0, 1)) +
+  geom_vline(xintercept = seq(3 + 0.5,
+                              max(dat_ar_long$x_id) - 0.5,
+                              by = 3),
+             linetype = "dashed", colour = "grey75") +
+
+  geom_rect(data = dat_ar_pos,
+            inherit.aes = FALSE,
+            aes(xmin = x_min, xmax = x_max,
+                ymin = 1.02, ymax = 1.12,  fill = color_type),
+            colour = NA) +
+
+   scale_fill_manual(values = c("Local Adverse Reactions" = "#E6E8C3",
+                                "Systemic Adverse Reactions" = "#d2c1dc",
+                                "Grade 1" = "#3374B8",
+                                "Grade 2" = "#93D2A3",
+                                "Grade 3" = "#F48F9C")) +
+
+  geom_text(data = dat_ar_pos,
+            inherit.aes = FALSE,
+            aes(x = x_mid, y = 1.07, label = `Adverse Reaction`),
+            size = 3.5,fontface = "bold")
+)
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_ar_info.pdf"),
+                plot_ar_info,width = 30,height = 17,units = "cm")
+
+alpha_calculate <- function(data){
+  alpha_diversity <- data.frame(row.names = rownames(data))
+  (alpha_diversity$num_species <- specnumber(data))
+
+  (alpha_diversity$shannon_species <- diversity(data,index = "shannon"))
+  (alpha_diversity$simpson_species <- diversity(data,index = "simpson"))
+  (alpha_diversity$inv_simpson_species <- diversity(data,index = "invsimpson"))
+  return(alpha_diversity)
+}
+
+alpha_diversity_gmb <- alpha_calculate(Species_full2)
+alpha_diversity_gmb <- alpha_diversity_gmb %>% mutate(ID = rownames(alpha_diversity_gmb)) %>%
+  merge(., dat_metadata_2, by = "ID", all.x = T) %>%
+  mutate(across(c(Gender,Vaccination,status), as.factor)) %>%
+  mutate(across(c(Age,Height,Weight), as.numeric))
+
+alpha.plot1_gmb_1 <- function(a){
+  aa <- deparse(substitute(a))
+  a_sub <- tolower(substr(aa,1,3))
+  labely <- c(num = 150, sha = 5, sim = 1.5, inv = 27)
+  c <- labely[a_sub]
+
+  lst <- c("Number of species","Shannon index","Simpson index","Inverse Simpson index")
+
+  for (i in lst) {
+
+    lst_sub <- tolower(substr(i, 1, 3))
+
+    if (a_sub == lst_sub) {
+
+      b <- i
+      break
+    }
+  }
+
+  b <- names(a)
+
+  a <- a[[1]]
+
+  g <- ggplot(alpha_diversity_gmb, aes(x = as.factor(alpha_diversity_gmb$status), y = a))+
+    geom_violin(linewidth = .5, alpha = .7,width = .5,
+                aes(fill=as.factor(alpha_diversity_gmb$status )),
+                trim=FALSE,
+                color = "white")+
+    geom_boxplot(aes(fill=as.factor(alpha_diversity_gmb$status )), width = .1,outlier.alpha = 0,coef = 0, position=position_dodge(0.9))+
+    labs(title = b, x= NULL, y = NULL)+
+
+    scale_x_discrete(breaks=c(0,1),
+                     labels=c("non-BTI", "BTI"))+
+    scale_fill_manual(values =c("#66C4B2", "#E1C14A"), labels = c("non-BTI", "BTI"))+
+    stat_compare_means(comparisons = list( c("0", "1")),method = "wilcox.test", size = 3, label = "p.signif")+
+
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(fill = "white",color = "black"),
+          axis.text.y = element_text(face = "bold",color = "black",size = 7),
+          axis.text.x = element_text(face = "bold",color = "black",size = 7),
+          plot.title = element_text(hjust = .5, size = 9, face = "bold"),
+          legend.title = element_blank(),
+          legend.position = "bottom"
+    )
+
+  g$layers[[2]]$aes_params$textsize <- 3
+  return(g)
+}
+(g1_gmb <- alpha.plot1_gmb_1(alpha_diversity_gmb["num_species"]))
+(g2_gmb <- alpha.plot1_gmb_1(alpha_diversity_gmb["shannon_species"]))
+(g3_gmb <- alpha.plot1_gmb_1(alpha_diversity_gmb["simpson_species"]))
+(g4_gmb <- alpha.plot1_gmb_1(alpha_diversity_gmb["inv_simpson_species"]))
+(g5_gmb <- ggpubr::ggarrange(g1_gmb, g2_gmb, g3_gmb, g4_gmb, nrow = 1,common.legend = T,legend = "bottom"))
+
+alpha.plot1_gmb_2 <- function(a){
+  aa <- deparse(substitute(a))
+  a_sub <- tolower(substr(aa,1,3))
+  labely <- c(num = 150, sha = 5, sim = 1.5, inv = 27)
+  c <- labely[a_sub]
+
+  lst <- c("Number of species","Shannon index","Simpson index","Inverse Simpson index")
+
+  for (i in lst) {
+
+    lst_sub <- tolower(substr(i, 1, 3))
+
+    if (a_sub == lst_sub) {
+
+      b <- i
+      break
+    }
+  }
+
+  b <- names(a)
+
+  a <- a[[1]]
+
+  g <- ggplot(alpha_diversity_gmb, aes(x = as.factor(alpha_diversity_gmb$Vaccination), y = a))+
+    geom_violin(linewidth = .5, alpha = .7,width = .5,
+                aes(fill=as.factor(alpha_diversity_gmb$Vaccination )),
+                trim=FALSE,
+                color = "white")+
+    geom_boxplot(aes(fill=as.factor(alpha_diversity_gmb$Vaccination )), width = .1,outlier.alpha = 0,coef = 0, position=position_dodge(0.9))+
+    labs(title = b, x= NULL, y = NULL)+
+    scale_x_discrete(breaks=c(0,1,2),
+                     labels=c("Vaccine_A", "Vaccine_B", "Vaccine_C"))+
+    scale_fill_manual(values =c("#0074BE", "#23A434", "#9E6BB3"), labels = c("Vaccine_A", "Vaccine_B", "Vaccine_C"))+
+    stat_compare_means(comparisons = list( c("Vaccine_A", "Vaccine_B"), c("Vaccine_B", "Vaccine_C"), c("Vaccine_A", "Vaccine_C")),method = "wilcox.test", size = 3, label = "p.signif")+
+
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(fill = "white",color = "black"),
+          axis.text.y = element_text(face = "bold",color = "black",size = 7),
+          axis.text.x = element_text(face = "bold",color = "black",size = 7),
+          plot.title = element_text(hjust = .5, size = 9, face = "bold"),
+          legend.title = element_blank(),
+          legend.position = "bottom"
+    )
+
+  g$layers[[2]]$aes_params$textsize <- 3
+  return(g)
+}
+(g1_gmb <- alpha.plot1_gmb_2(alpha_diversity_gmb["num_species"]))
+(g2_gmb <- alpha.plot1_gmb_2(alpha_diversity_gmb["shannon_species"]))
+(g3_gmb <- alpha.plot1_gmb_2(alpha_diversity_gmb["simpson_species"]))
+(g4_gmb <- alpha.plot1_gmb_2(alpha_diversity_gmb["inv_simpson_species"]))
+(g5_gmb <- ggpubr::ggarrange(g1_gmb, g2_gmb, g3_gmb, g4_gmb, nrow = 1,common.legend = T,legend = "bottom"))
+
+beta_calculate <- function(data){
+  bray_gmb<-vegdist(data,method="bray", na.rm = T)
+  bray_gmb<-as.matrix(bray_gmb)
+
+  pCoa_gmb <- cmdscale( bray_gmb, eig = T,k = 3 )
+
+  varExp_gmb <- (eigenvals(pCoa_gmb)/sum(eigenvals(pCoa_gmb)))[1:3]
+  xVar_gmb <- as.numeric(varExp_gmb[1]*100)
+  yVar_gmb <- as.numeric(varExp_gmb[2]*100)
+  zVar_gmb <- as.numeric(varExp_gmb[3]*100)
+
+  pCoaVecs_gmb <- as.data.frame(pCoa_gmb$points)
+  pCoaVecsDF_gmb <- cbind.data.frame(data.frame(PCoA=c(1:3)),data.frame(VarExplained=varExp_gmb))
+  pCoaVecs_gmb$ID <- row.names(pCoaVecs_gmb)
+
+  pCoaVecs_gmb <- subset(pCoaVecs_gmb, select = -ncol(pCoaVecs_gmb))
+  return(list(pCoaVecs_gmb, xVar_gmb, yVar_gmb, bray_gmb))
+  print('pCoaVecs_gmb, xVar_gmb, yVar_gmb, bray_gmb')
+}
+
+beta_diversity_gmb <- beta_calculate(Species_full2)
+pCoaVecs_gmb <- beta_diversity_gmb[[1]] %>% mutate(ID = rownames(beta_diversity_gmb[[1]])) %>%
+  merge(., dat_metadata_2, by = "ID", all.x = T) %>%
+  dplyr::select(.,-Name,-Height,-Weight,-YN_ID,-status) %>%
+  rename(PCo1_gmb = PCo1, PCo2_gmb = PCo2, PCo3_gmb = PCo3) %>%
+  mutate(infection_dat14 = ifelse( infection_day <= 14 ,1,0)) %>%
+  mutate(across(c(Gender,Vaccination, infection_dat14  ), as.factor)) %>%
+  mutate(across(c(Age,BMI), as.numeric)) %>%
+  merge(., tibble::rownames_to_column(dat_GMT_day14), by.x = "ID", by.y = "rowname", all.x = T)
+
+pCoaVecs_gmb_baseline <- beta_diversity_gmb[[1]] %>% mutate(ID = rownames(beta_diversity_gmb[[1]])) %>%
+  merge(., dat_metadata_2, by = "ID", all.x = T) %>%
+  select(.,ID, PCo1, , PCo2, PCo3, Gender, Age, BMI, Vaccination) %>%
+  rename(PCo1_gmb = PCo1, PCo2_gmb = PCo2, PCo3_gmb = PCo3) %>%
+  mutate(across(c(Gender,Vaccination), as.factor)) %>%
+  mutate(across(c(Age,BMI), as.numeric)) %>%
+  merge(., tibble::rownames_to_column(dat_GMT_baseline), by.x = "ID", by.y = "rowname", all.x = T)
+
+adonis2(beta_diversity_gmb[[4]] ~ Vaccination + Gender + Age + BMI,
+                                 data = pCoaVecs_gmb, permutations = 999, by = "margin")
+
+adonis2(beta_diversity_gmb[[4]] ~ status + Gender + Age + BMI,
+        data = pCoaVecs_gmb, permutations = 999, by = "margin")
+
+adonis2(beta_diversity_gmb[[4]][na.omit(pCoaVecs_gmb)$ID,na.omit(pCoaVecs_gmb)$ID] ~
+          Prototype + Alpha + Beta + `BA.4_5` + BF.7 + XBB.1.5 + XBB.1.16 + XBB.1.9.1 + BQ.1.1 + JN.1,
+        data = na.omit(pCoaVecs_gmb), permutations = 999, by = "margin")
+
+adonis2(beta_diversity_gmb[[4]][na.omit(pCoaVecs_gmb)$ID,na.omit(pCoaVecs_gmb)$ID] ~
+          Prototype + Alpha + Beta + `BA.4_5` + BF.7 + XBB.1.5 + XBB.1.16 + XBB.1.9.1 + BQ.1.1 + JN.1 +
+          Vaccination + Gender + Age + BMI,
+        data = na.omit(pCoaVecs_gmb), permutations = 999, by = "margin")
+
+res_adonis_all <- adonis2(beta_diversity_gmb[[4]][na.omit(pCoaVecs_gmb)$ID,na.omit(pCoaVecs_gmb)$ID] ~
+          Prototype + Alpha + Beta + `BA.4_5` + BF.7 + XBB.1.5 + XBB.1.16 + XBB.1.9.1 + BQ.1.1 + JN.1 +
+          Vaccination + Gender + Age + BMI + BTI_day180 +
+          pain + swelling + acute.allergic.reaction + vomitting + jonit.pain + Muscular.pain + headache + cold + fatigue + fever,
+        data = na.omit(pCoaVecs_gmb), permutations = 999, by = "margin")
+
+res_adonis_all_baseline <- adonis2(beta_diversity_gmb[[4]][na.omit(pCoaVecs_gmb_baseline)$ID,na.omit(pCoaVecs_gmb_baseline)$ID] ~
+                            Prototype + Alpha + Beta + `BA.4_5` + BF.7 + XBB.1.5 + XBB.1.16 + XBB.1.9.1 + BQ.1.1 + JN.1 +
+                            Vaccination + Gender + Age + BMI,
+                          data = na.omit(pCoaVecs_gmb_baseline), permutations = 999, by = "margin")
+
+adonis_result_xbb.1.5 <- adonis2(beta_diversity_gmb[[4]][na.omit(pCoaVecs_gmb)$ID,na.omit(pCoaVecs_gmb)$ID] ~
+          XBB.1.5,
+        data = na.omit(pCoaVecs_gmb), permutations = 999, by = "margin")
+
+(beta_gmb_xbb.1.5 <- ggplot(na.omit(pCoaVecs_gmb), aes(x=PCo1_gmb, y=PCo2_gmb, color=log(XBB.1.5))) +
+    geom_point(size=.9) +
+    scale_color_gradient2(name = "Log(XBB.1.5 GMT)",
+                          low = "white", high = "#fa8d10",
+                          midpoint = median(log(na.omit(pCoaVecs_gmb)$XBB.1.5)) * 0.3
+                          )+
+
+    theme_classic() +
+    xlab(paste0("PCo1 (", round(beta_diversity_gmb[[2]],2), "%)")) +
+    ylab(paste0("PCo2 (", round(beta_diversity_gmb[[3]],2), "%)")) +
+    geom_vline(xintercept = 0,lty="dashed",colour = "grey70")+
+    geom_hline(yintercept = 0,lty="dashed",colour = "grey70")+
+
+    annotate("text", x=-0.2, y=.18, size = 3,
+             label = paste0("P[adonis] == ", format(adonis_result_xbb.1.5$"Pr(>F)"[1], digits = 3)),
+             parse = TRUE,
+             fontface = "bold",
+             color = "black")+
+    theme(panel.background = element_rect(color = "black"),
+          panel.border = element_rect(color = "black", size = 1, fill = NA),
+          axis.text = element_text(face = "bold",color = "black",size = 10),
+          axis.title.x = element_text(size = 10, face = "bold"),
+          axis.title.y = element_text(size = 10, face = "bold"),
+          legend.title = element_text(size = 10, face = "bold"),
+          legend.position = "right",
+
+    ))
+
+ggplot2::ggsave(file.path(output_dir, "Diversity", "beta_gmb_xbb.1.5.pdf"),
+                beta_gmb_xbb.1.5,width = 11,height = 7,units = "cm")
+
+plot_beta_point <- function(gmt, color, legend_name){
+
+  pCoaVecs_gmb_plot <- beta_calculate(Species_full2)[[1]] %>%
+    rename(PCo1_gmb = PCo1, PCo2_gmb = PCo2, PCo3_gmb = PCo3) %>%
+    merge(., dat_GMT_day14, by = "row.names", all.x = T) %>%
+    rename(ID = Row.names)
+
+  pCoaVecs_gmb_plot <- pCoaVecs_gmb_plot %>% dplyr::select(., PCo1_gmb, PCo2_gmb, gmt, ID)
+
+  formula <- as.formula(paste0("beta_calculate(Species_full2)[[4]][na.omit(pCoaVecs_gmb_plot)$ID,na.omit(pCoaVecs_gmb_plot)$ID] ~ ", gmt))
+
+  adonis_result <- adonis2(formula, data = na.omit(pCoaVecs_gmb_plot), permutations = 999, by = "margin")
+  colnames(pCoaVecs_gmb_plot)[3] <- "NBs"
+
+  (beta_gmb <- ggplot(na.omit(pCoaVecs_gmb_plot), aes(x=PCo1_gmb, y=PCo2_gmb)) +
+      geom_point(size=2, shape = 21, aes(fill = log(NBs)), color = "white") +
+      scale_fill_gradient2(name = legend_name,
+                           low = "white", high = color,
+                           midpoint = median(log(na.omit(pCoaVecs_gmb_plot)$NBs)) * 0.3
+      )+
+
+      theme_classic() +
+      xlab(paste0("PCo1 (", round(beta_calculate(Species_full2)[[2]],2), "%)")) +
+      ylab(paste0("PCo2 (", round(beta_calculate(Species_full2)[[3]],2), "%)")) +
+      geom_vline(xintercept = 0,lty="dashed",colour = "grey70")+
+      geom_hline(yintercept = 0,lty="dashed",colour = "grey70")+
+
+      annotate("text", x=-0.4, y= -0.3, size = 3,
+               label = paste0("P[adonis] == ", format(adonis_result$"Pr(>F)"[1], digits = 3)),
+               parse = TRUE,
+               fontface = "bold",
+               color = "black")+
+      theme(panel.background = element_rect(color = "black"),
+            panel.border = element_rect(color = "black", size = 1, fill = NA),
+            axis.text = element_text(face = "bold",color = "black",size = 10),
+            axis.title.x = element_text(size = 10, face = "bold"),
+            axis.title.y = element_text(size = 10, face = "bold"),
+            legend.title = element_text(size = 10, face = "bold"),
+            legend.key.size = unit(.5, "cm"),
+            legend.position = "right",
+
+      ))
+
+  return(beta_gmb)
+}
+
+beta_gmb_bq.1.1 <- plot_beta_point("BQ.1.1", "#a2a2a2", "Log(BQ.1.1 GMT)")
+beta_gmb_jn.1 <- plot_beta_point("JN.1", "#b472b4", "Log(JN.1 GMT)")
+
+beta_gmb_gmt <- wrap_plots(beta_gmb_bq.1.1, beta_gmb_jn.1, ncol = 2)
+
+variable_class <- data.frame(variable = c("Prototype", "Alpha", "Beta", "BA.4_5", "BF.7", "XBB.1.5", "XBB.1.16", "XBB.1.9.1", "BQ.1.1", "JN.1",
+                        "Gender", "Age", "BMI", "BTI_day180", "Vaccination",
+                        "pain", "swelling", "acute.allergic.reaction", "vomitting", "jonit.pain", "Muscular.pain", "headache", "cold", "fatigue", "fever"),
+           class = c(rep("Neutralizing Antibodies Day 14", 10), rep("Demographics",3), "Infection Status", "Vaccine Type", rep("Adverse Reactions",10)))
+
+variable_class_baseline <- data.frame(variable = c("Prototype", "Alpha", "Beta", "BA.4_5", "BF.7", "XBB.1.5", "XBB.1.16", "XBB.1.9.1", "BQ.1.1", "JN.1",
+                                          "Gender", "Age", "BMI", "Vaccination"),
+                             class = c(rep("Neutralizing Antibodies Baseline", 10), rep("Demographics",3), "Vaccine Type"))
+
+dat_adonis_all <- as.data.frame(res_adonis_all[,c("R2","Pr(>F)")]) %>%
+  merge(., variable_class, by.x = "row.names", by.y = "variable", all.y = T) %>%
+  mutate(significance = case_when(
+    `Pr(>F)` < 0.001 ~ "***",
+    `Pr(>F)` < 0.01 ~ "**",
+    `Pr(>F)` < 0.05 ~ "*",
+    TRUE ~ ""
+  ))
+
+dat_adonis_all <- as.data.frame(res_adonis_all_baseline[,c("R2","Pr(>F)")]) %>%
+  merge(., variable_class_baseline, by.x = "row.names", by.y = "variable", all.y = T) %>%
+  mutate(significance = case_when(
+    `Pr(>F)` < 0.001 ~ "***",
+    `Pr(>F)` < 0.01 ~ "**",
+    `Pr(>F)` < 0.05 ~ "*",
+    TRUE ~ ""
+  ))
+
+dat_adonis_all$Row.names <- factor(dat_adonis_all$Row.names, levels = dat_adonis_all$Row.names[order(dat_adonis_all$R2)])
+
+ggplot(dat_adonis_all, aes(x = R2, y = reorder(Row.names, R2), fill = class)) +
+  geom_col() +
+
+  geom_text(aes(label = significance, x = R2 + max(R2)*0.05),
+            size = 6, vjust = 0.7) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x = "Proportions of variation in taxonomy explained by variables",
+    y = "",
+    title = "",
+    fill = "Variable Categorization"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+
+    legend.text = element_text(face = "bold", size = 10),
+    legend.title = element_text(face = "bold", size = 10),
+    legend.position = c(0.7, 0.3),
+    legend.key.size = unit(.3, "cm"),
+    axis.text.x = element_text(face = "bold",color = "black"),
+    axis.text.y = element_text(face = "bold",color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.title.y = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10),
+    plot.margin = unit(c(10,100,10,10), unit = "pt"),
+    panel.grid.major.x = element_line(color = "gray90"),
+
+    panel.grid.major.y = element_line(),
+
+  )
+
+pCoaVecs_gmb_path <- beta_calculate(dat_path2)[[1]] %>% mutate(ID = rownames(beta_diversity_gmb[[1]])) %>%
+  merge(., pCoaVecs_gmb, by = "ID", all.x = T) %>%
+  rename(PCo1_path = PCo1, PCo2_path = PCo2, PCo3_path = PCo3) %>%
+  merge(., select(alpha_diversity_gmb, ID, num_species, shannon_species, simpson_species, inv_simpson_species),
+        by = "ID", all.x = T)
+
+plot_beta_point_path <- function(gmt, color, legend_name){
+
+  pCoaVecs_path_plot <- pCoaVecs_gmb_path %>% dplyr::select(., PCo1_path, PCo2_path, gmt, ID)
+
+  formula <- as.formula(paste0("beta_calculate(dat_path2)[[4]][na.omit(pCoaVecs_path_plot)$ID,na.omit(pCoaVecs_path_plot)$ID] ~ ", gmt))
+
+  adonis_result <- adonis2(formula, data = na.omit(pCoaVecs_path_plot), permutations = 999, by = "margin")
+  colnames(pCoaVecs_path_plot)[3] <- "NBs"
+
+  (beta_gmb <- ggplot(na.omit(pCoaVecs_path_plot), aes(x=PCo1_path, y=PCo2_path)) +
+      geom_point(size=2, shape = 21, aes(fill = log(NBs)), color = "white") +
+      scale_fill_gradient2(name = legend_name,
+                            low = "white", high = color,
+                            midpoint = median(log(na.omit(pCoaVecs_path_plot)$NBs)) * 0.3
+      )+
+
+      theme_classic() +
+      xlab(paste0("PCo1 (", round(beta_calculate(dat_path2)[[2]],2), "%)")) +
+      ylab(paste0("PCo2 (", round(beta_calculate(dat_path2)[[3]],2), "%)")) +
+      geom_vline(xintercept = 0,lty="dashed",colour = "grey70")+
+      geom_hline(yintercept = 0,lty="dashed",colour = "grey70")+
+
+      annotate("text",
+
+               x=-0.22, y=-0.05,
+               size = 3,
+               label = paste0("P[adonis] == ", format(adonis_result$"Pr(>F)"[1], digits = 3)),
+               parse = TRUE,
+               fontface = "bold",
+               color = "black")+
+      theme(panel.background = element_rect(color = "black"),
+            panel.border = element_rect(color = "black", size = 1, fill = NA),
+            axis.text = element_text(face = "bold",color = "black",size = 10),
+            axis.title.x = element_text(size = 10, face = "bold"),
+            axis.title.y = element_text(size = 10, face = "bold"),
+            legend.title = element_text(size = 10, face = "bold"),
+            legend.key.size = unit(.5, "cm"),
+            legend.position = "right",
+
+      ))
+
+  return(beta_gmb)
+}
+
+beta_path_xbb.1.5 <- plot_beta_point_path("XBB.1.5", "#fa8d10", "Log(XBB.1.5 GMT)")
+beta_path_xbb.1.9.1 <- plot_beta_point_path("XBB.1.9.1", "#f166ad", "Log(XBB.1.9.1 GMT)")
+beta_path_bq.1.1 <- plot_beta_point_path("BQ.1.1", "#a2a2a2", "Log(BQ.1.1 GMT)")
+beta_path_jn.1 <- plot_beta_point_path("JN.1", "#b472b4", "Log(JN.1 GMT)")
+
+beta_gmbpath_gmt <- wrap_plots(beta_gmb_bq.1.1, beta_path_xbb.1.5, beta_path_bq.1.1,
+                               beta_gmb_jn.1, beta_path_xbb.1.9.1, beta_path_jn.1, ncol = 3)
+beta_gmbpath_gmt
+
+ggplot2::ggsave(file.path(output_dir, "Diversity", "beta_gmbpath_gmt.pdf"),
+                beta_gmbpath_gmt,width = 30,height = 12,units = "cm")
+
+pca_res <- prcomp(na.omit(dat_GMT_day14_log), center = TRUE, scale. = TRUE)
+
+summary(pca_res)
+
+scores_pca_gmt <- as.data.frame(pca_res$x)
+
+ggplot(scores_pca_gmt, aes(x = PC1, y = PC2)) +
+  geom_point(size = 2, alpha = 0.8) +
+  theme_bw() +
+  labs(
+    x = paste0("PC1 (",
+               round(summary(pca_res)$importance[2, 1] * 100, 1),
+               "%)"),
+    y = paste0("PC2 (",
+               round(summary(pca_res)$importance[2, 2] * 100, 1),
+               "%)")
+  )
+
+scores_pca_gmt <- cbind(scores_pca_gmt, dat_metadata_2[rownames(scores_pca_gmt),])
+
+summary(lm(PC1 ~ Vaccination + Gender + Age + BMI, data = scores_pca_gmt))
+summary(lm(PC1 ~ Vaccination + Gender + Age + BMI + pain + swelling +
+             acute.allergic.reaction + vomitting + jonit.pain + Muscular.pain +
+             headache + cold + fatigue + fever, data = scores_pca_gmt))
+
+summary(lm(PC2 ~ Vaccination + Gender + Age + BMI + pain + swelling +
+             acute.allergic.reaction + vomitting + jonit.pain + Muscular.pain +
+             headache + cold + fatigue + fever, data = scores_pca_gmt))
+
+scores_pca_gmt <- cbind(scores_pca_gmt, beta_calculate(Species_full2)[[1]][rownames(scores_pca_gmt),])
+
+scores_pca_gmt <- beta_calculate(dat_path2)[[1]][rownames(scores_pca_gmt),] %>%
+  rename(PCo1_path = PCo1, PCo2_path = PCo2, PCo3_path = PCo3) %>%
+  cbind(scores_pca_gmt,.)
+
+summary(lm(PC1 ~ Vaccination + Gender + Age + BMI + PCo1 + PCo2 + PCo3, data = scores_pca_gmt))
+
+scores_pca_gmt_data <- scores_pca_gmt %>%
+  mutate(across(where(~ is.numeric(.) && !is.factor(.)), scale))
+
+res_cor_pc1 <- summary(lm(PC1 ~ Vaccination + Gender + Age + BMI + pain + swelling +
+                            acute.allergic.reaction + vomitting + jonit.pain + Muscular.pain +
+                            headache + cold + fatigue + fever + BTI_day180 +
+                            PCo1 + PCo2 + PCo3 + PCo1_path + PCo2_path + PCo3_path, data = scores_pca_gmt_data))$coefficients
+res_cor_pc1 <- rename(as.data.frame(res_cor_pc1)[-1,],
+                      cor_pc1 = Estimate, se_pc1 = `Std. Error`, t_pc1 = `t value`, p_pc1 = `Pr(>|t|)`)
+
+res_cor_pc2 <- summary(lm(PC2 ~ Vaccination + Gender + Age + BMI + pain + swelling +
+                            acute.allergic.reaction + vomitting + jonit.pain + Muscular.pain +
+                            headache + cold + fatigue + fever + BTI_day180 +
+                            PCo1 + PCo2 + PCo3 + PCo1_path + PCo2_path + PCo3_path, data = scores_pca_gmt_data))$coefficients
+res_cor_pc2 <- rename(as.data.frame(res_cor_pc2)[-1,],
+                      cor_pc2 = Estimate, se_pc2 = `Std. Error`, t_pc2 = `t value`, p_pc2 = `Pr(>|t|)`)
+
+res_cor_all <- cbind(res_cor_pc1, res_cor_pc2)
+
+res_cor_all <- tibble::rownames_to_column(res_cor_all,var = "name") %>%
+  mutate(label = c("Vaccination (Vaccine_B vs Vaccine_A)",
+                   "Vaccination (Vaccine_C vs Vaccine_A)",
+                   "Gender (Male vs Female)",
+                   "Age",
+                   "BMI",
+                   "Pain",
+                   "Swelling",
+                   "Acute Allergic Reaction",
+                   "Vomitting",
+                   "Joint Pain",
+                   "Muscular Pain",
+                   "Headache",
+                   "Cold",
+                   "Fatigue",
+                   "Fever",
+                   "Breakthrough Infection",
+                   "PCo1 Species",
+                   "PCo2 Species",
+                   "PCo3 Species",
+                   "PCo1 Pathways",
+                   "PCo2 Pathways",
+                   "PCo3 Pathways"),
+         class = c("Vaccination Type",
+                   "Vaccination Type",
+                   rep("Demographics",3),
+                   rep("Adverse Reactions",10),
+                   "Infection Status",
+                   rep("Metagenomic Diversity Indicators",6)),
+         significance_pc1 = case_when(
+           p_pc1 < 0.001 ~ "***",
+           p_pc1 < 0.01 ~ "**",
+           p_pc1 < 0.05 ~ "*",
+           T ~ ""
+         ),
+         significance_pc2 = case_when(
+           p_pc2 < 0.001 ~ "***",
+           p_pc2 < 0.01 ~ "**",
+           p_pc2 < 0.05 ~ "*",
+           T ~ ""
+         )
+  )
+
+res_cor_all$Row.names <- factor(res_cor_all$Row.names, levels = res_cor_all$Row.names[order(res_cor_all$R2)])
+
+res_cor_gmt_pc1 <- ggplot(res_cor_all, aes(x = cor_pc1, y = reorder(label, cor_pc1), fill = class)) +
+  geom_col() +
+
+  geom_text(aes(label = significance_pc1, x = cor_pc1 + max(cor_pc1)*0.05),
+            size = 6, vjust = 0.7) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x = "Coefficients with PC1 of \n generalized linear regression model",
+    y = "",
+    title = "",
+    fill = "Variable Categorization"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+
+    legend.text = element_text(face = "bold", size = 10),
+    legend.title = element_text(face = "bold", size = 10),
+
+    legend.key.size = unit(.3, "cm"),
+    axis.text.x = element_text(face = "bold",color = "black"),
+    axis.text.y = element_text(face = "bold",color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.title.y = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10),
+    plot.margin = unit(c(10,100,10,10), unit = "pt"),
+    panel.grid.major.x = element_line(color = "gray90"),
+
+    panel.grid.major.y = element_line(),
+
+  )
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_cor_gmt_pc1.pdf"),
+                res_cor_gmt_pc1,width = 23,height = 16,units = "cm")
+
+res_cor_gmt_pc2 <- ggplot(res_cor_all, aes(x = cor_pc2, y = reorder(label, cor_pc2), fill = class)) +
+  geom_col() +
+
+  geom_text(aes(label = significance_pc2, x = cor_pc2 + max(cor_pc2)*0.05),
+            size = 6, vjust = 0.7) +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(
+    x = "Coefficients with PC2 of \n generalized linear regression model",
+    y = "",
+    title = "",
+    fill = "Variable Categorization"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+
+    legend.text = element_text(face = "bold", size = 10),
+    legend.title = element_text(face = "bold", size = 10),
+
+    legend.key.size = unit(.3, "cm"),
+    axis.text.x = element_text(face = "bold",color = "black"),
+    axis.text.y = element_text(face = "bold",color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.title.y = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10),
+    plot.margin = unit(c(10,100,10,10), unit = "pt"),
+    panel.grid.major.x = element_line(color = "gray90"),
+
+    panel.grid.major.y = element_line(),
+
+  )
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_cor_gmt_pc2.pdf"),
+                res_cor_gmt_pc2,width = 23,height = 16,units = "cm")
+
+correlation_analysis_psych <- function(df1, df2) {
+
+  cor_results <- corr.test(df1, df2, adjust = "none", method = "spearman")
+
+  results <- data.frame(
+    x = rep(colnames(df1), each = ncol(df2)),
+    y = rep(colnames(df2), times = ncol(df1)),
+    coef = as.vector(cor_results$r),
+    p = as.vector(cor_results$p)
+  )
+
+  return(results)
+}
+
+res_cor_pc_all <- correlation_analysis_psych(scores_pca_gmt[,c("PC1","PC2")],
+                                             scores_pca_gmt %>% select(Age, BMI, pain:PCo3_path))
+res_cor_pc_all <- cbind(filter(res_cor_pc_all, x == "PC1") %>% rename(coef_pc1 = coef, p_pc1 = p) %>% select(-x),
+                        filter(res_cor_pc_all, x == "PC2") %>% rename(coef_pc2 = coef, p_pc2 = p) %>% select(-x, -y))
+res_cor_pc_all <- mutate(res_cor_pc_all, y = recode(y, "vomitting" = "Vomitting", "swelling" = "Swelling", "fatigue" = "Fatigue",
+                                                    "PCo1" = "PCo1 Species", "PCo3" = "PCo3 Species", "PCo2_path" = "PCo2 Pathways"))
+
+res_cor_pc_all_print <- mutate(res_cor_pc_all, y = recode(y, "pain" = "Pain", "acute.allergic.reaction" = "Acute Allergic Reaction",
+                                                    "jonit.pain" = "Joint Pain", "Muscular.pain" = "Muscular Pain",
+                                                    "headache" = "Headache", "cold" = "Cold", "fever" = "Fever",
+                                                    "PCo2" = "PCo2 Species", "PCo1_path" = "PCo1 Pathways", "PCo3_path" = "PCo3 Pathways",
+                                                    )) %>%
+  arrange(p_pc1) %>%
+  mutate(across(c(coef_pc1, coef_pc2, p_pc1, p_pc2), ~ round(., 3)))
+
+ft_pc <- flextable(res_cor_pc_all_print)
+ft_pc <- align(ft_pc, align = "left", part = "all")
+ft_pc
+
+doc_pc <- read_docx()
+doc_pc <- body_add_par(doc_pc, "", style = "Normal")
+doc_pc <- body_add_flextable(doc_pc, ft_pc)
+
+print(doc_pc, target = file.path(output_dir, "Base_information", "PC_res_table.docx"))
+
+filter(res_cor_pc_all, p_pc1 < 0.05 | p_pc2 < 0.05)
+
+scale_factor_1 <- max(scores_pca_gmt$PC1) / max(filter(res_cor_pc_all, p_pc1 < 0.05 | p_pc2 < 0.05)$coef_pc1)
+scale_factor_2 <- max(scores_pca_gmt$PC2) / max(filter(res_cor_pc_all, p_pc1 < 0.05 | p_pc2 < 0.05)$coef_pc2)
+
+range(scores_pca_gmt$PC1)
+range(scores_pca_gmt$PC2)
+
+(plot_pc_gmt <- ggplot(scores_pca_gmt) +
+
+    geom_point(size = 3, alpha = 1, shape = 21,
+               aes(x = PC1, y = PC2, fill = Vaccination), color = "white") +
+
+    scale_fill_manual(values =c("#0074BE", "#23A434", "#9E6BB3"), labels = c("Vaccine_A", "Vaccine_B", "Vaccine_C"))+
+
+    labs(x = paste0("PC1 (", round(summary(pca_res)$importance[2, 1] * 100, 1), "%)"),
+         y = paste0("PC2 (", round(summary(pca_res)$importance[2, 2] * 100, 1), "%)"),
+         color = "Vaccination Type") +
+
+    theme_classic2() +
+
+    geom_segment(data = filter(res_cor_pc_all, p_pc1 < 0.05 | p_pc2 < 0.05),
+
+                 aes(x = 0, y = 0, xend = coef_pc1 * scale_factor_1, yend = coef_pc2 * scale_factor_2),
+                 size = 1,
+                 arrow = arrow(angle = 35,length=unit(0.3,"cm"))
+    )+
+
+    geom_label_repel(data = filter(res_cor_pc_all, p_pc1 < 0.05 | p_pc2 < 0.05),
+                     aes(x = coef_pc1 * scale_factor_1, y = coef_pc2 * scale_factor_2, label = y),
+                     size = 4,fontface = "bold", color = "black") +
+
+    scale_x_continuous(expand = c(0.1,0.1),limits = c(-7,7), breaks = seq(-6,6,3),
+                       sec.axis = sec_axis(~ . / scale_factor_1, name = "Correlation r with PC1")) +
+
+    scale_y_continuous(expand = c(0.1,0.1),limits = c(-5.5,4), breaks = seq(-4,4,2),
+                       sec.axis = sec_axis(~ . / scale_factor_2, name = "Correlation r with PC2"))+
+
+    theme(axis.title = element_text(color = "black", face = "bold", size = 12),
+          axis.text = element_text(color = "black", face = "bold", size = 12),
+          legend.title = element_text(color = "black", face = "bold", size = 12),
+          legend.text =  element_text(color = "black", size = 10),
+          axis.line = element_line(color = "black", linewidth = .8),
+          axis.ticks = element_line(color = "black", linewidth = .8))
+)
+
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_PCA_GMT.pdf"),
+                plot_pc_gmt,width = 14,height = 10,units = "cm")
+
+loadings_gmt <- as.data.frame(pca_res$rotation)
+loadings_gmt$Antibody <- rownames(loadings_gmt)
+
+top_pc1_gmt <- loadings_gmt %>%
+  arrange(desc(abs(PC1))) %>%
+  slice(1:10) %>%
+  select(Antibody, PC1)
+
+top_pc2_gmt <- loadings_gmt %>%
+  arrange(desc(abs(PC2))) %>%
+  slice(1:10) %>%
+  select(Antibody, PC2)
+
+(plot_pc_gmt_loading <- ggplot(scores_pca_gmt) +
+
+    geom_point(size = 3, alpha = 1, shape = 21,
+               aes(x = PC1, y = PC2, fill = Vaccination), color = "white") +
+
+    scale_fill_manual(values =c("#0074BE", "#23A434", "#9E6BB3"), labels = c("Vaccine_A", "Vaccine_B", "Vaccine_C"))+
+
+    labs(x = paste0("PC1 GMT Day 14 (", round(summary(pca_res)$importance[2, 1] * 100, 1), "%)"),
+         y = paste0("PC2 GMT Day 14 (", round(summary(pca_res)$importance[2, 2] * 100, 1), "%)"),
+         color = "Vaccination Type") +
+
+    theme_classic2() +
+
+    geom_segment(data = loadings_gmt[, c("PC1", "PC2", "Antibody")],
+                 aes(x = 0, y = 0, xend = PC1 * 15, yend = PC2 * 10),
+                 arrow = arrow(angle = 35, length = unit(0.3, "cm")),
+                 color = "black", size = 1) +
+
+    geom_label_repel(data = loadings_gmt[, c("PC1", "PC2", "Antibody")],
+                     aes(x = PC1 * 15, y = PC2 * 10, label = Antibody),
+                     size = 3, fontface = "bold", color = "black", fontface = "bold") +
+
+    theme(axis.title = element_text(color = "black", face = "bold", size = 12),
+          axis.text = element_text(color = "black", face = "bold", size = 12),
+          legend.title = element_text(color = "black", face = "bold", size = 12),
+          legend.text =  element_text(color = "black", size = 10),
+          axis.line = element_line(color = "black", linewidth = .8),
+          panel.border = element_rect(color = "black", size = 1, fill = NA),
+          axis.ticks = element_line(color = "black", linewidth = .8))
+)
+ggplot2::ggsave(file.path(output_dir, "Base_information", "plot_PCA_GMT_loading.pdf"),
+                plot_pc_gmt_loading,width = 14,height = 10,units = "cm")
+
+diversity_gmb <- cbind(alpha_calculate(Species_full2),
+                       beta_calculate(Species_full2)[[1]])
+diversity_gmb <- diversity_gmb %>% dplyr::select(-inv_simpson_species)
+diversity_gmb <- diversity_gmb[rownames(Species_full2),]
+diversity_gmb <- scale(diversity_gmb)
+diversity_gmb <- diversity_gmb %>% as.data.frame() %>%  rename(Richness = num_species,
+                                              `Shannon Index` = shannon_species,
+                                              `Simpson Index` = simpson_species)
+
+diversity_path <- cbind(alpha_calculate(dat_path2), beta_calculate(dat_path2)[[1]])
+diversity_path <- diversity_path %>% dplyr::select(-inv_simpson_species)
+diversity_path <- scale(diversity_path)
+diversity_path <- diversity_path %>% as.data.frame() %>% rename(Richness = num_species,
+                          `Shannon Index` = shannon_species,
+                          `Simpson Index` = simpson_species)
+
+diversity_data_product <- function(input_data){
+  dta_diversity <- cbind(alpha_calculate(input_data),
+                         beta_calculate(input_data)[[1]])
+  dta_diversity <- dta_diversity %>% dplyr::select(-inv_simpson_species)
+  dta_diversity <- dta_diversity[rownames(input_data),]
+  dta_diversity <- scale(dta_diversity)
+  dta_diversity <- dta_diversity %>% as.data.frame() %>%  rename(Richness = num_species,
+                                                                 `Shannon Index` = shannon_species,
+                                                                 `Simpson Index` = simpson_species)
+  return(dta_diversity)
+}
+
+LM_gmb_gmt <- function(df_diversity, data_gmt, data_metadata, ytitle = "Species Diversity Indicators",
+                       formule = as.formula(paste0("outcome ~ exposure + gmt_baseline + Gender + Age + BMI + Vaccination"))
+)
+                       {
+
+  df_diversity <- as.data.frame(df_diversity)
+
+  result_diversity_gmt <- data.frame(
+    x_variable = character(),
+    y_variable = character(),
+    coefficient = numeric(),
+    p_value = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  for (outcome in colnames(data_gmt)) {
+
+    for (exposure in colnames(df_diversity)) {
+
+      metadata <- cbind(outcome = data_gmt[data_metadata$ID, outcome, drop = FALSE],
+                        diversity_dat = df_diversity[data_metadata$ID, exposure],
+                        gmt_baseline = dat_GMT_baseline_log[data_metadata$ID, outcome],
+                        data_metadata)
+
+      colnames(metadata)[1] <- "outcome"
+      colnames(metadata)[2] <- "exposure"
+
+      model <- glm(formule,
+                   na.action = na.exclude, data = metadata)
+
+      coef_val <- summary(model)$coefficients[2, 1]
+      p_val <- summary(model)$coefficients[2, 4]
+
+      result_diversity_gmt <- rbind(result_diversity_gmt, data.frame(x_variable = exposure,
+                                                                     y_variable = outcome,
+                                                                     coefficient = coef_val,
+                                                                     p_value = p_val))
+    }
+  }
+
+  result_diversity_gmt$FDR_p_value <- NA
+
+  for (y in unique(result_diversity_gmt$y_variable)) {
+
+    subset_results <- result_diversity_gmt[result_diversity_gmt$y_variable == y, ]
+
+    result_diversity_gmt$FDR_p_value[result_diversity_gmt$y_variable == y] <- p.adjust(subset_results$p_value, method = "fdr")
+  }
+
+  result_diversity_gmt <- result_diversity_gmt %>%
+    mutate(y_variable = factor(y_variable, levels = colnames(data_gmt)),
+           x_variable = factor(x_variable, levels = rev(c("Richness", "Shannon Index", "Simpson Index", "PCo1", "PCo2", "PCo3")
+           )
+           )
+    )
+
+  (correlation_diversity_gmt_day14 <- ggplot(result_diversity_gmt, aes(x = y_variable, y = x_variable)) +
+
+      geom_point(
+
+        aes(size = -log10(FDR_p_value)),
+        shape = 21, fill = "grey80", color = "white", show.legend = FALSE
+      ) +
+
+      geom_point(
+        data = subset(result_diversity_gmt, FDR_p_value < 0.2),
+        aes(fill = coefficient, size = -log10(FDR_p_value)),
+        shape = 21, color = "white"
+      ) +
+
+      scale_fill_gradient2(
+        low = "#58B4E9",
+        mid = "white",
+        high = "firebrick3",
+        midpoint = 0,
+      ) +
+      scale_size(name = expression(-log[10](FDR~p)),
+                 range = c(2, 6),
+                 guide = guide_legend(
+                   override.aes = list(
+                     shape = 21,
+                     fill  = "#58B4E9",
+                     color = "white"
+                   )
+                 )) +
+      theme_classic()+
+      theme(
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", size = .5, fill = NA),
+        axis.title.x = element_text(size = 10, color = "black", face = "bold"),
+        axis.title.y = element_text(size = 10, color = "black", face = "bold"),
+        axis.text.x =  element_text(size = 10, color = "black", face = "bold", angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+        legend.title = element_text(size = 10, color = "black", face = "bold"),
+        panel.grid.major = element_line(color = "gray90"),
+        plot.title = element_blank()
+      ) +
+      labs(
+        title = "",
+        x = "Neutralizing Antibodies",
+        y = ytitle,
+        size = "-Log10(FDR P)",
+        fill = "Linear Regression Coefficient"
+      ))
+
+  return(list(result_diversity_gmt, correlation_diversity_gmt_day14))
+}
+
+plot_gmbdiversity_gmt <- LM_gmb_gmt(df_diversity = diversity_gmb, dat_GMT_day14_log, dat_metadata_2_day14,
+                                    "Species Diversity Indicators")[[2]]
+
+dat_gmb_log <- log(Species_full2 + 0.0000001)
+dat_gmb_clr <- as.data.frame(clr(Species_full2))
+
+final_res_maaslin_baseline <- run_maaslin_outcomes(
+  dat_gmb_log,
+  dat_GMT_baseline_log,
+  dat_metadata_2,
+  "species_gmt_baseline",
+  covariates = c("Gender", "Age", "BMI")
+)
+
+final_res_maaslin_day7 <- run_maaslin_outcomes(
+  dat_gmb_log,
+  dat_GMT_day7_log,
+  dat_metadata_2_day7,
+  "species_gmt_day7",
+  baseline_data = dat_GMT_baseline_log,
+  outcomes = colnames(dat_GMT_day7_log)[1:9]
+)
+
+final_res_maaslin <- run_maaslin_outcomes(
+  dat_gmb_log,
+  dat_GMT_day14_log,
+  dat_metadata_2_day14,
+  "species_gmt_day14",
+  baseline_data = dat_GMT_baseline_log
+)
+
+final_res_maaslin_day28 <- run_maaslin_outcomes(
+  dat_gmb_log,
+  dat_GMT_day28_log,
+  dat_metadata_2_day28,
+  "species_gmt_day28",
+  baseline_data = dat_GMT_baseline_log
+)
+
+final_res_maaslin_day90 <- run_maaslin_outcomes(
+  dat_gmb_log,
+  dat_GMT_day90_log,
+  dat_metadata_2_day90,
+  "species_gmt_day90",
+  baseline_data = dat_GMT_baseline_log
+)
+
+final_res_maaslin_day180 <- run_maaslin_outcomes(
+  dat_gmb_log,
+  dat_GMT_day180_log,
+  dat_metadata_2_day180,
+  "species_gmt_day180",
+  baseline_data = dat_GMT_baseline_log
+)
+
+species_results_by_time <- list(
+  baseline = final_res_maaslin_baseline,
+  day7 = final_res_maaslin_day7,
+  day14 = final_res_maaslin,
+  day28 = final_res_maaslin_day28,
+  day90 = final_res_maaslin_day90,
+  day180 = final_res_maaslin_day180
+)
+
+name_all_gmb_sig <- species_results_by_time %>%
+  purrr::map(~ dplyr::filter(.x, qval < 0.2) %>% dplyr::pull(feature)) %>%
+  unlist(use.names = FALSE) %>%
+  unique()
+
+gmb_counts <- species_results_by_time %>%
+  purrr::map(~ dplyr::filter(.x, qval < 0.2) %>% dplyr::pull(feature)) %>%
+  unlist(use.names = FALSE) %>%
+  tibble::tibble(feature = .) %>%
+  dplyr::count(feature, name = "Counts") %>%
+  dplyr::mutate(feature_label = sub("_", " ", sub("s__", "", feature)))
+
+prepare_species_results <- function(model_results, outcome_levels, feature_levels = NULL) {
+  prepared <- model_results %>%
+    dplyr::select(feature, outcome, coef, qval, pval) %>%
+    dplyr::filter(feature %in% name_all_gmb_sig) %>%
+    dplyr::mutate(
+      feature_label = sub("_", " ", sub("s__", "", feature)),
+      outcome = factor(outcome, levels = outcome_levels)
+    )
+
+  if (is.null(feature_levels)) {
+    feature_levels <- prepared %>%
+      dplyr::group_by(feature_label) %>%
+      dplyr::summarise(total_coef = sum(coef), .groups = "drop") %>%
+      dplyr::arrange(dplyr::desc(total_coef)) %>%
+      dplyr::pull(feature_label)
+  }
+
+  prepared %>%
+    dplyr::mutate(
+      feature = factor(feature, levels = unique(feature)),
+      feature_label = factor(feature_label, levels = feature_levels)
+    )
+}
+
+sig_results <- prepare_species_results(
+  final_res_maaslin,
+  colnames(dat_GMT_day14_log)
+)
+species_feature_levels <- levels(sig_results$feature_label)
+
+sig_results_day0 <- prepare_species_results(
+  final_res_maaslin_baseline,
+  colnames(dat_GMT_baseline_log),
+  species_feature_levels
+)
+sig_results_day7 <- prepare_species_results(
+  final_res_maaslin_day7,
+  colnames(dat_GMT_day7_log),
+  species_feature_levels
+)
+sig_results_day28 <- prepare_species_results(
+  final_res_maaslin_day28,
+  colnames(dat_GMT_day28_log),
+  species_feature_levels
+)
+sig_results_day90 <- prepare_species_results(
+  final_res_maaslin_day90,
+  colnames(dat_GMT_day90_log),
+  species_feature_levels
+)
+sig_results_day180 <- prepare_species_results(
+  final_res_maaslin_day180,
+  colnames(dat_GMT_day180_log),
+  species_feature_levels
+)
+
+final_res_maaslin_path <- run_maaslin_outcomes(
+  dat_path2_ha_log,
+  dat_GMT_day14_log,
+  dat_metadata_2_day14,
+  "pathway_gmt_day14",
+  baseline_data = dat_GMT_baseline_log
+)
+
+sig_gmt_14_name <- final_res_maaslin_path %>%
+  dplyr::group_by(feature) %>%
+  dplyr::summarise(selected = any(qval < 0.2), .groups = "drop") %>%
+  dplyr::filter(selected) %>%
+  dplyr::pull(feature)
+
+sig_results_path <- final_res_maaslin_path %>%
+  dplyr::select(feature, outcome, coef, qval, pval) %>%
+  dplyr::filter(feature %in% sig_gmt_14_name) %>%
+  dplyr::left_join(smarttable_pathway, by = "feature") %>%
+  dplyr::rename(
+    Pathway_ID = feature,
+    GMT = outcome,
+    feature = Pathway_name,
+    Category = Pathway
+  ) %>%
+  dplyr::mutate(
+    GMT = factor(GMT, levels = colnames(dat_GMT_day14_log)),
+    arragne_value = coef / pmax(qval, .Machine$double.xmin),
+    Pathway_group = recode_pathway_group(Ontology_type)
+  ) %>%
+  dplyr::group_by(feature_new) %>%
+  dplyr::mutate(total_coef_feature = sum(arragne_value)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    direction = ifelse(total_coef_feature > 0, "Positive", "Negative"),
+    Pathway_group = factor(
+      Pathway_group,
+      levels = c(
+        "Amino acid metabolism", "Carbohydrate metabolism",
+        "Cofactor biosynthesis", "Nucleotide metabolism",
+        "Lipid biosynthesis"
+      )
+    )
+  ) %>%
+  dplyr::arrange(direction, Pathway_group, coef) %>%
+  dplyr::mutate(
+    feature_new = factor(feature_new, levels = rev(unique(feature_new))),
+    Pathway_ID = factor(Pathway_ID, levels = rev(unique(Pathway_ID)))
+  ) %>%
+  dplyr::select(-total_coef_feature)
+
+path_counts <- final_res_maaslin_path %>%
+  dplyr::filter(qval < 0.2) %>%
+  dplyr::count(feature, name = "Counts") %>%
+  dplyr::left_join(
+    sig_results_path %>%
+      dplyr::transmute(
+        feature = as.character(Pathway_ID),
+        feature_new,
+        Pathway_group
+      ) %>%
+      dplyr::distinct(),
+    by = "feature"
+  )
+
+correlation_path_gmt_day14 <- ggplot(
+  sig_results_path,
+  aes(x = GMT, y = feature_new)
+) +
+  geom_tile(fill = "white", color = "gray90") +
+  geom_tile(
+    data = subset(sig_results_path, pval < 0.05 | qval < 0.2),
+    aes(fill = coef),
+    color = "gray90"
+  ) +
+  geom_text(
+    aes(label = ifelse(
+      qval < 0.05,
+      "***",
+      ifelse(qval < 0.1, "**", ifelse(qval < 0.2, "*", ""))
+    )),
+    color = "black",
+    size = 4
+  ) +
+  scale_fill_gradient2(
+    low = "#58B4E9",
+    mid = "white",
+    high = "firebrick3",
+    midpoint = 0
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(
+      color = "black",
+      face = "bold",
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(color = "black", face = "bold"),
+    axis.title = element_text(face = "bold", size = 10),
+    legend.position = "left"
+  ) +
+  labs(
+    x = "Neutralizing antibodies",
+    y = "Metagenomic functional pathways",
+    fill = "MaAsLin2 coefficient"
+  )
+
+path_counts <- path_counts %>%
+  dplyr::mutate(
+    feature_new = factor(
+      feature_new,
+      levels = levels(sig_results_path$feature_new)
+    )
+  )
+
+plot_path_counts_gmt_day14 <- ggplot(
+  path_counts,
+  aes(x = Counts, y = feature_new, fill = Pathway_group)
+) +
+  geom_col() +
+  scale_fill_manual(
+    values = scales::alpha(
+      c("#0a65c1", "#65c10a", "#c1c10a", "#c1650a", "#c10a0a"),
+      0.7
+    ),
+    name = "Pathway type"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.title = element_text(face = "bold", size = 10),
+    panel.grid.major.x = element_line(color = "gray90")
+  ) +
+  labs(x = "Association number", y = "")
+
+key_gmb_info <- final_res_maaslin %>%
+  select(feature, outcome, coef, qval, pval) %>%
+  filter(., feature %in% (final_res_maaslin %>%
+                            pivot_wider(
+                              id_cols = feature,
+                              names_from = outcome,
+                              values_from = qval
+                            ) %>%
+                            tibble::column_to_rownames("feature") %>%
+                            as.matrix() %>% .[rowSums(. < 0.2) > 0,] %>% rownames())) %>%
+  mutate(outcome = factor(outcome, levels = colnames(dat_GMT_day7_log)))
+
+key_gmb_info$feature <- factor(key_gmb_info$feature, levels = (key_gmb_info %>%
+                                                                     group_by(feature) %>%
+                                                                     summarize(total_coef = sum(coef)) %>%
+                                                                     arrange(desc(total_coef)))$feature)
+
+key_gmb_info <-key_gmb_info %>%
+  group_by(feature) %>%
+  mutate(total_coef_feature = sum(coef)) %>%
+  ungroup() %>%
+  mutate(direction = ifelse(total_coef_feature > 0, "Positive", "Negative")) %>%
+  dplyr::select(., -total_coef_feature)
+
+key_gmb_name <- levels(key_gmb_info$feature)
+key_gmb_name_neg <- sub("s__","", unique(dplyr::filter(key_gmb_info, direction == "Negative")$feature))
+key_path_name_2 <- unique(filter(sig_results_path, Pathway_ID %in% sig_gmt_14_name)$feature)
+
+pathab$Pathway_name <- sub(":.+$","",pathab$ID)
+
+pathab <- pathab %>% dplyr::mutate(Pathway_name = sub(":.+$","",ID), .before = 1)
+
+pathab_allgmb <- pathab %>% mutate(., contribute = rowSums(dplyr::select(pathab, -c(ID, Pathway_name,)))) %>%
+  filter(Pathway_name %in% c("PWY-6612")) %>%
+  dplyr::select(ID, Pathway_name, contribute)
+
+pathab_all_key <- filter(pathab, Pathway_name %in% key_path_name_2)
+
+pathab_all_key <- pathab_all_key %>%
+  mutate(species = str_extract(ID, "(?<=s__)[^;]*$")) %>%
+  mutate(species = ifelse(grepl("\\|unclassified", ID), "unclassified", species))
+pathab_all_key <- filter(pathab_all_key, species %in%
+                           c(NA, sub("s__", "",  key_gmb_name)))
+
+contribution_path_gmb <- pathab_all_key %>% dplyr::select(.,c(ID, Pathway_name, species)) %>%
+  dplyr::mutate(contribute = rowSums(dplyr::select(pathab_all_key, -c(ID, Pathway_name, species))),
+         Pathway_name_species = paste0(Pathway_name, "_", species))
+
+contribution_path_gmb <- outer(key_path_name_2, c(NA, sub("s__", "",  key_gmb_name)), paste, sep = "_") %>% as.vector() %>%
+  data.frame(Pathway_name_species = ., Pathway_name = key_path_name_2) %>%
+  merge(., dplyr::select(contribution_path_gmb, -Pathway_name), by = "Pathway_name_species", all = T) %>%
+  dplyr::mutate(species = sub("^[^_]*_", "", Pathway_name_species),
+         contribute = replace_na(contribute, 0))
+
+contribution_path_gmb$feature <- stringr::str_replace_all(contribution_path_gmb$Pathway_name,"-","_") %>% paste0("Path_",.)
+
+contribution_path_gmb <- contribution_path_gmb %>%
+  dplyr::filter(., species %in% c("NA")) %>%
+  dplyr::select(., Pathway_name, contribute) %>%
+  dplyr::rename(., abundance = contribute) %>%
+  merge(contribution_path_gmb,., by = "Pathway_name") %>%
+  filter(species != "NA") %>%
+  dplyr::mutate(percentage = 100 * contribute / abundance) %>%
+  dplyr::mutate(percentage = case_when(species %in% key_gmb_name_neg ~ percentage*-1,
+                                       T ~ percentage))
+
+colors_yn <- c(
+  "#c10a0a", "#f28f8f",
+  "#c1650a", "#f2b98f",
+  "#c1c10a", "#f2e28f",
+  "#65c10a", "#b9f28f",
+  "#0ac10a", "#8ff28f",
+  "#0ac165", "#8ff2b9",
+  "#0ac1c1", "#8ff2f2",
+  "#0a65c1", "#8fb9f2",
+
+  "#650ac1", "#b98ff2",
+
+  "#c10a65", "#f28fb9"
+)
+
+(contri_path_gmb_plot <- ggplot(data = contribution_path_gmb, id.vars  = "species")+
+    geom_bar(aes(x = factor(Pathway_name, levels = sub(":.+$","",levels(sig_results_path$feature_new))),
+                 y = percentage, fill = factor(species, levels = rev(sub("s__", "", levels(key_gmb_info$feature))))
+                 ),
+             stat='identity', width = 0.8)+
+
+    scale_fill_manual(values = colors_yn,
+                      name = "Species")+
+
+    xlab("") + ylab("Contribution of key species \n in pathways (%)") +
+
+    theme_classic()+
+
+    theme(axis.text.x = element_text(color = "black", face = "bold", size = 10),
+          axis.text.y = element_blank(),
+          axis.title.x = element_text(face = "bold", size = 10),
+          axis.title.y = element_text(face = "bold", size = 10),
+          legend.position = "right",
+
+          panel.grid.major = element_line(color = "gray90"),
+          panel.background = element_blank()
+
+    )+
+    coord_flip(clip = "off")
+  )
+
+df_path_long <- dat_path2_ha_log %>%
+
+  dplyr::select(sig_gmt_14_name,) %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(
+    cols = -Sample,
+    names_to = "Pathway_ID",
+    values_to = "Value"
+  ) %>%
+  merge(., dplyr::select(filter(sig_results_path, Pathway_ID %in% sig_gmt_14_name),
+                         Pathway_ID,Pathway_group, feature_new, Ontology_type, coef, qval, direction, arragne_value), by = "Pathway_ID", all.x = T)
+
+(plot_ab_path <- ggplot(df_path_long, aes(x = factor(feature_new, levels = levels(filter(sig_results_path, Pathway_ID %in% sig_gmt_14_name)$feature_new)),
+                                          color = Pathway_group,
+
+                                          y = Value)) +
+  geom_boxplot(
+    width = 0.5,
+    size = .7,
+    alpha = 1,
+    outlier.alpha = 0.6, outlier.size = .7
+
+  ) +
+    scale_color_manual(values = c("#0a65c1", "#65c10a", "#c1c10a", "#c1650a", "#c10a0a"), name = "Pathways Type")+
+
+  coord_flip(clip = "off") +
+    scale_y_continuous(limits = c(-2, 1))+
+  theme_classic()+
+  theme(
+    axis.text.x = element_text(color = "black", face = "bold", size = 10),
+    axis.title.x = element_text(face = "bold", size = 10),
+
+    axis.title.y = element_blank(),
+
+    axis.text.y = element_blank(),
+
+    legend.position = "right",
+
+    panel.grid.major = element_line(color = "gray90"),
+    panel.background = element_blank(),
+    panel.border = element_rect(color = "black", size = .5, fill = NA),
+  ) +
+  labs(x = "Metagenomic Functional Pathways", y = "Log(Relative Abundance)")+
+  guides(
+    fill = guide_legend(
+      override.aes = list(shape = 21, color = "black", size = 4)
+    )
+  )
+)
+
+(plot_path_final <- wrap_plots(list(correlation_path_gmt_day14, plot_ab_path, plot_path_counts_gmt_day14, contri_path_gmb_plot)) +
+    plot_layout(nrow = 1,
+                guides = "collect",
+                widths = c(1,1,1, 1)
+                ) &
+    theme(plot.margin = unit(c(0, 0.1, 0, 0.1), "cm"),
+          legend.position = "right",
+          legend.key.size = unit(.4, "cm"),
+          legend.title = element_text(color = "black", face = "bold", size = 10),
+
+          panel.spacing = unit(0, "pt")))
+
+ggplot2::ggsave(file.path(output_dir, "MaAsLin_cor", "plot_path_final.pdf"),
+                plot_path_final,width = 46,height = 20,units = "cm")
+
+all_coef <- c(
+  sig_results_day0$coef, sig_results_day7$coef, sig_results$coef,
+  sig_results_day28$coef, sig_results_day90$coef, sig_results_day180$coef
+)
+L <- max(abs(range(all_coef, na.rm = TRUE)))
+fill_limits <- c(-L, L)
+fill_breaks  <- pretty_breaks(5)(fill_limits)
+
+gmb_gmt_plot <- function(dat,
+                         y_label = element_blank(),
+                         fill_limits = fill_limits,
+                         fill_breaks = fill_breaks,
+                         x_title) {
+  plot <- ggplot(dat, aes(x = outcome, y = feature_label)) +
+    geom_tile(data = subset(dat, pval >= 0.05),
+              fill = "white", color = "gray90", show.legend = FALSE) +
+    geom_tile(data = subset(dat, pval < 0.05),
+              aes(fill = coef), color = "gray90") +
+    geom_text(aes(label = ifelse(qval < 0.05, "***",
+                                 ifelse(qval < 0.1, "**",
+                                        ifelse(qval < 0.2, "*", "")))),
+              color = "black", size = 4) +
+    scale_fill_gradient2(
+      low = "#58B4E9", mid = "white", high = "firebrick3",
+      midpoint = 0,
+      limits = fill_limits,
+      breaks = fill_breaks,
+      oob = squish,
+      name = "MaAsLin2 Coefficient"
+    ) +
+    theme_classic() +
+    theme(
+      panel.background = element_rect(color = "black", size = .5, fill = NA),
+      panel.border = element_rect(color = "black", size = .5, fill = NA),
+      legend.key.size = unit(.4, "cm"),
+      legend.title = element_text(color = "black", face = "bold", size = 10),
+      axis.title.x = element_text(color = "black", face = "bold", size = 10),
+      axis.title.y = y_label,
+      axis.text.x  = element_text(size = 10, color = "black", angle = 45, hjust = 1, face = "bold"),
+      axis.text.y  = y_label,
+      plot.title = element_blank()
+    ) +
+    labs(x = x_title, y = "Metagenomic Species")
+  return(plot)
+}
+
+gmb_counts <- mutate(gmb_counts, feature_label = factor(feature_label, levels = levels(sig_results$feature_label)))
+
+gmb_counts <- gmb_counts %>% mutate(., phylum = tax_gmb2$phylum[match(gmb_counts$feature, tax_gmb2$species)],
+                                    phylum = sub("p__","", phylum))
+
+(plot_gmb_counts <- ggplot(gmb_counts, aes(x = Counts, y = feature_label, fill = phylum)) +
+    geom_col() +
+    scale_fill_manual(values = c("#A9D693", "#C0A7CE", "#E2CD78","#EC8840","#F5BCBB"),
+                      name = "Microbial Phylum") +
+    scale_color_manual(values = c("#A9D693", "#C0A7CE", "#E2CD78","#EC8840","#F5BCBB"),
+                       name = "Microbial Phylum") +
+
+    labs(
+      x = "Association number",
+      y = "",
+      title = ""
+
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+
+      legend.text = element_text(face = "bold", size = 10),
+      legend.title = element_text(face = "bold", size = 10),
+
+      axis.text.x = element_text(face = "bold",color = "black"),
+
+      axis.text.y = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.title.x = element_text(face = "bold", size = 10),
+      axis.title.y = element_text(face = "bold", size = 10),
+      axis.text = element_text(size = 10),
+      panel.grid.major.x = element_line(color = "gray90"),
+
+      panel.grid.major.y = element_line(),
+
+    )
+)
+
+gmt_counts_cal <- function(dat, gmt_name, y_label = element_blank(),
+                           limits = c(0,15), breaks = c(0,3,6,9,12,15)){
+
+  res <- as.data.frame(table(factor(dat,
+                                    gmt_name, exclude = NULL))) %>%
+    rename(GMT = Var1, Counts = Freq)
+
+  (plot_gmt_counts <- ggplot(res, aes(x = GMT, y = Counts, fill = GMT)) +
+      geom_col() +
+      scale_fill_manual(values = c("#98D6CB", "#e4e4a7", "#C3C0DE", "#FA8C7F", "#8CB8D6",  "#FCBB70", "#BAE178", "#FBD2E7","#DDDDDD", "#C28CC2")) +
+      scale_color_manual(values = c("#98D6CB", "#e4e4a7", "#C3C0DE", "#FA8C7F", "#8CB8D6",  "#FCBB70", "#BAE178", "#FBD2E7","#DDDDDD", "#C28CC2")) +
+
+      scale_y_continuous(limits = limits,
+                         breaks = breaks)+
+
+      labs(
+
+        y = "Association number",
+        title = ""
+
+      ) +
+      theme_classic(base_size = 12) +
+      theme(
+
+        legend.text = element_text(face = "bold", size = 10),
+        legend.key.size = unit(.4, "cm"),
+        legend.title = element_text(color = "black", face = "bold", size = 10),
+
+        axis.text.x = element_blank(),
+
+        axis.text.y = element_text(face = "bold",color = "black"),
+
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.title.x = element_blank(),
+        axis.title.y = y_label,
+        axis.text = element_text(size = 10),
+        panel.grid.major.x = element_line(color = "gray90"),
+
+        panel.grid.major.y = element_line(),
+
+      )
+  )
+
+  return(plot_gmt_counts)
+}
+
+gmt_counts <- list()
+gmt_counts[[1]] <- gmt_counts_cal(filter(final_res_maaslin_baseline, qval < 0.2)$metadata, colnames(dat_GMT_baseline_log), element_text(face = "bold", size = 10))
+gmt_counts[[2]] <- gmt_counts_cal(filter(final_res_maaslin_day7, qval < 0.2)$metadata, colnames(dat_GMT_day7_log)[1:9])
+gmt_counts[[3]] <- gmt_counts_cal(filter(final_res_maaslin, qval < 0.2)$metadata, colnames(dat_GMT_day14_log))
+gmt_counts[[4]] <- gmt_counts_cal(filter(final_res_maaslin_day28, qval < 0.2)$metadata, colnames(dat_GMT_day28_log))
+gmt_counts[[5]] <- gmt_counts_cal(filter(final_res_maaslin_day90, qval < 0.2)$metadata, colnames(dat_GMT_day90_log))
+gmt_counts[[6]] <- gmt_counts_cal(filter(final_res_maaslin_day180, qval < 0.2)$metadata, colnames(dat_GMT_day180_log))
+
+area_gmt_nb_1 <- area(1,1,1,2)
+area_gmt_nb_2 <- area(1,3,1,4)
+area_gmt_nb_3 <- area(1,5,1,6)
+area_gmt_nb_4 <- area(1,7,1,8)
+area_gmt_nb_5 <- area(1,9,1,10)
+area_gmt_nb_6 <- area(1,11,1,12)
+
+area_gmt_gmb_1 <- area(2,1,6,2)
+area_gmt_gmb_2 <- area(2,3,6,4)
+area_gmt_gmb_3 <- area(2,5,6,6)
+area_gmt_gmb_4 <- area(2,7,6,8)
+area_gmt_gmb_5 <- area(2,9,6,10)
+area_gmt_gmb_6 <- area(2,11,6,12)
+
+area_gmb_nb <- patchwork::area(t = 2, l = 13, b = 6, r = 13)
+
+layout_custom_gmb_gmt <- c(area_gmt_nb_1, area_gmt_nb_2, area_gmt_nb_3, area_gmt_nb_4, area_gmt_nb_5, area_gmt_nb_6,
+                           area_gmt_gmb_1, area_gmt_gmb_2, area_gmt_gmb_3, area_gmt_gmb_4, area_gmt_gmb_5, area_gmt_gmb_6,
+                           area_gmb_nb)
+
+patch_gmb_gmt <- c(gmt_counts,list(
+  gmb_gmt_plot(sig_results_day0, element_text(size = 10, color = "black", face = "bold"),
+               fill_limits, fill_breaks, "Neutralizing antibodies Baseline"),
+  gmb_gmt_plot(sig_results_day7, element_blank(), fill_limits, fill_breaks, "Neutralizing antibodies Day 7"),
+  gmb_gmt_plot(sig_results,      element_blank(), fill_limits, fill_breaks, "Neutralizing antibodies Day 14"),
+  gmb_gmt_plot(sig_results_day28, element_blank(), fill_limits, fill_breaks, "Neutralizing antibodies Day 28"),
+  gmb_gmt_plot(sig_results_day90, element_blank(), fill_limits, fill_breaks, "Neutralizing antibodies Day 90"),
+  gmb_gmt_plot(sig_results_day180,element_blank(), fill_limits, fill_breaks, "Neutralizing antibodies Day 180"),
+  plot_gmb_counts))
+
+correlation_gmb_gmt_final <- wrap_plots(patch_gmb_gmt)+
+  plot_layout(nrow = 2,
+              guides = "collect",
+
+              design = layout_custom_gmb_gmt
+  ) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"),
+        legend.position = "right",
+        legend.key.size = unit(.4, "cm"),
+        legend.title = element_text(color = "black", face = "bold", size = 10),
+
+        panel.spacing = unit(0, "pt"))
+correlation_gmb_gmt_final
+
+ggplot2::ggsave(file.path(output_dir, "MaAsLin_cor", "correlation_gmb_gmt_final.pdf"),
+                correlation_gmb_gmt_final,width = 55,height = 25,units = "cm")
+
+selected_species_ck <- sig_results %>%
+  dplyr::filter(qval < 0.2) %>%
+  dplyr::pull(feature) %>%
+  as.character() %>%
+  unique()
+
+selected_pathways_ck <- sig_results_path %>%
+  dplyr::filter(qval < 0.2) %>%
+  dplyr::pull(Pathway_ID) %>%
+  as.character() %>%
+  unique()
+
+final_res_maaslin_gmb_ck <- run_maaslin_outcomes(
+  dat_gmb_log[, selected_species_ck, drop = FALSE],
+  dat_cytokines_day1_log,
+  dat_metadata_2,
+  "species_immune_mediator_day1",
+  baseline_data = dat_cytokines_baseline_log
+)
+
+final_res_maaslin_path_ck <- run_maaslin_outcomes(
+  dat_path2_ha_log[, selected_pathways_ck, drop = FALSE],
+  dat_cytokines_day1_log,
+  dat_metadata_2,
+  "pathway_immune_mediator_day1",
+  baseline_data = dat_cytokines_baseline_log
+)
+
+sig_results_gmb_ck <- final_res_maaslin_gmb_ck %>%
+  dplyr::select(feature, metadata,outcome, coef, qval, pval) %>%
+  mutate(feature_label = sub("s__", "", feature),
+         feature_label = sub("_", " ", feature_label)) %>%
+  filter(., feature %in% (final_res_maaslin_gmb_ck %>%
+                            pivot_wider(
+                              id_cols = feature,
+                              names_from = outcome,
+                              values_from = qval
+                            ) %>%
+                            tibble::column_to_rownames("feature") %>%
+                            as.matrix() %>% .[rowSums(. < 0.2) > 0,] %>% rownames())) %>%
+  filter(., outcome %in% (final_res_maaslin_gmb_ck %>%
+                            pivot_wider(
+                              id_cols = outcome,
+                              names_from = feature,
+                              values_from = qval
+                            ) %>%
+                            tibble::column_to_rownames("outcome") %>%
+                            as.matrix() %>% .[rowSums(. < 0.2) > 0,] %>% rownames()))
+
+sig_results_gmb_ck$feature <- factor(sig_results_gmb_ck$feature, levels = levels(sig_results$feature))
+
+sig_results_gmb_ck <- sig_results_gmb_ck %>% mutate(outcome = sub("_", "-", outcome))
+
+sig_results_gmb_ck$cytokines_type <- type_cytokines$Type[match(sig_results_gmb_ck$outcome, type_cytokines$Names_rf)]
+sig_results_gmb_ck <- mutate(sig_results_gmb_ck,
+                             cytokines_type = factor(cytokines_type,
+                                                     levels = c("Chemokines", "Cytokine Receptors",
+                                                                 "Immunomarkers", "Adhesion Molecules"))) %>%
+
+  arrange(., cytokines_type) %>%
+  mutate(outcome = factor(outcome, levels = unique(outcome)))
+
+sig_results_gmb_ck <- sig_results_gmb_ck %>% mutate(., phylum = tax_gmb2$phylum[match(sig_results_gmb_ck$feature, tax_gmb2$species)],
+                                                    phylum = sub("p__","", phylum)) %>%
+  arrange(., phylum) %>% mutate(feature_label = factor(feature_label, levels = rev(unique(feature_label))))
+
+(correlation_gmb_ck_day1 <- ggplot(sig_results_gmb_ck, aes(x = outcome, y = feature_label)) +
+    geom_tile(aes(fill = coef), color = "grey") +
+    geom_text(aes(label = ifelse(qval < 0.05, "***",
+                                 ifelse(qval < 0.1, "**",
+                                        ifelse(qval < 0.20, "*", "")))),
+              color = "black", size = 4) +
+    scale_fill_gradient2(
+      low = "#58B4E9",
+      mid = "white",
+      high = "firebrick3",
+      midpoint = 0
+    ) +
+    theme_classic() +
+    theme(
+      axis.text.x = element_blank(),
+      axis.text.y =  element_blank(),
+      axis.title.x =  element_blank(),
+      axis.title.y =  element_blank(),
+      panel.background = element_blank(),
+
+      legend.key.size = unit(.5, "cm"),
+      legend.text = element_text(size = 10, color = "black"),
+      legend.title = element_text(face = "bold", size = 10, color = "black"),
+      panel.border = element_rect(color = "black", size = .5, fill = NA),
+
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    labs(
+      fill = "MaAsLin2 Coefficient"
+    ))
+
+(info_cy_gmb <- ggplot(sig_results_gmb_ck, aes(x = outcome, y = "Immune Mediators Type")) +
+  geom_tile(aes(fill = cytokines_type, color = cytokines_type)) +
+  scale_fill_manual(values = c("#D7E69A", "#FAF299", "#FAA69A","#D79CBB", "#60A199","#9D8292"),
+                    name = "Immune Mediators Type") +
+  scale_color_manual(values = c("#D7E69A", "#FAF299", "#FAA69A", "#D79CBB","#60A199","#9D8292"),
+                    name = "Immune Mediators Type") +
+    theme_minimal() +
+    scale_y_discrete(position = "left") +
+    labs(
+
+      x = "Immune Mediators Day 1",
+    )+
+  theme(
+    axis.text.x = element_text(size = 10, color = "black", face = "bold", angle = 45, hjust = 1),
+    axis.title.x = element_text(size = 12, color = "black", face = "bold"),
+
+    axis.text.y = element_blank(),
+    axis.title = element_blank(),
+    panel.background = element_blank(),
+
+    legend.key.size = unit(.5, "cm"),
+    legend.text = element_text(size = 10, color = "black"),
+
+    legend.title = element_text(size = 10, color = "black", face = "bold")
+  ))
+
+(info_gmb_ck <- ggplot(sig_results_gmb_ck, aes(y = feature_label, x = "Microbial Phylum")) +
+  geom_tile(aes(fill = phylum , color = phylum )) +
+  scale_fill_manual(values = c("#A9D693", "#C0A7CE", "#E2CD78","#EC8840","#F5BCBB"),
+                    name = "Microbial Phylum") +
+  scale_color_manual(values = c("#A9D693", "#C0A7CE", "#E2CD78","#EC8840","#F5BCBB"),
+                     name = "Microbial Phylum") +
+    scale_x_discrete(position = "top") +
+    theme_minimal() +
+    labs(
+      y = "Microbial Species Baseline"
+    )+
+  theme(
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+    axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+    axis.title = element_blank(),
+    panel.background = element_blank(),
+
+    legend.key.size = unit(.5, "cm"),
+    legend.text = element_text(size = 10, color = "black"),
+
+    legend.title = element_text(size = 10, color = "black", face = "bold")
+  ))
+
+area_b <- patchwork::area(t = 1, l = 2, b = 25, r = 21)
+area_c <- patchwork::area(t = 26, l = 2, b = 26, r = 21)
+area_a <- patchwork::area(t = 1, l = 1, b = 25, r = 1)
+
+layout_custom <- c(area_a,area_b,area_c)
+
+correlation_gmb_ck_day1_final <- info_gmb_ck + correlation_gmb_ck_day1 + info_cy_gmb +
+  plot_layout(nrow = 2,
+              guides = "collect",
+
+              design = layout_custom
+  ) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"),
+
+        panel.spacing = unit(0, "pt"))
+correlation_gmb_ck_day1_final
+
+ggplot2::ggsave(file.path(output_dir, "MaAsLin_cor", "correlation_gmb_ck_day1_final.pdf"),
+                correlation_gmb_ck_day1_final,width = 21,height = 14,units = "cm")
+
+filter(final_res_maaslin_path_ck, qval < 0.20)
+filter(final_res_maaslin_path_ck, pval < 0.05)
+
+sig_maaslin_path_ck <- final_res_maaslin_path_ck %>%
+  dplyr::select(feature, metadata, outcome, coef, qval, pval)  %>%
+  mutate(outcome = recode(outcome,
+                          "SE_SELETION" = "sE-selectin",
+                          "SIGLEC_5" = "Siglec-5",
+                          "TNF_a" = "TNF-alpha"),
+         outcome = sub("_", "-", outcome))
+
+sig_maaslin_path_ck <- filter(sig_maaslin_path_ck, feature %in% (sig_maaslin_path_ck %>%
+                                                                       pivot_wider(
+                                                                         id_cols = feature,
+                                                                         names_from = outcome,
+                                                                         values_from = qval
+                                                                       ) %>%
+                                                                       tibble::column_to_rownames("feature") %>%
+                                                                       as.matrix() %>% .[rowSums(. < 0.2) > 0,] %>% rownames())) %>%
+  filter(., outcome %in% (sig_maaslin_path_ck %>%
+                                              pivot_wider(
+                                                id_cols = outcome,
+                                                names_from = feature,
+                                                values_from = qval
+                                              ) %>%
+                                              tibble::column_to_rownames("outcome") %>%
+                                              as.matrix() %>% .[rowSums(. < 0.2) > 0,] %>% rownames()))
+
+sig_maaslin_path_ck <- sig_maaslin_path_ck %>%
+  merge(., smarttable_pathway, by.x = "feature", by.y = "feature", all.x =T, sort = F) %>%
+  mutate(Pathway_group = recode(Ontology_type,
+                                "Carbohydrates-Degradation" = "Carbohydrate metabolism",
+                                "Carbohydrates-Biosynthesis" = "Carbohydrate metabolism",
+                                "Lipid-Biosynthesis" = "Lipid biosynthesis",
+                                "Amino-Acid-Biosynthesis" = "Amino acid metabolism",
+                                "Nucleotide-Biosynthesis" = "Nucleotide metabolism",
+                                "Nucleo-Deg" = "Nucleotide metabolism",
+                                "Other-biosynthesis" = "Cofactor biosynthesis",
+                                "Carboxylate-Biosynthesis" = "Amino acid metabolism",
+                                "Cofactor-Biosynthesis" = "Cofactor biosynthesis",
+                                "Energy-Metabolism" = "Carbohydrate metabolism",
+                                "Secondary-Metabolite-Biosynthesis" = "Nucleotide metabolism",
+                                "Polymer-Degradation" = "Carbohydrate metabolism",
+                                "Cyclitols-Deg" = "Carbohydrate metabolism"
+  ))
+
+sig_maaslin_path_ck$cytokines_type <- type_cytokines$Type[match(sig_maaslin_path_ck$outcome, type_cytokines$Names)]
+sig_maaslin_path_ck <- mutate(sig_maaslin_path_ck,
+                              arragne_value = coef/qval,
+                             cytokines_type = factor(cytokines_type,
+                                                     levels = c("Chemokines", "Cytokines","Cytokine Receptors", "Immunomarkers",
+                                                                "Adhesion Molecules", "Enzymes", "Hormones"))) %>%
+  mutate(arragne_value = coef/qval) %>%
+  group_by(feature_new) %>%
+  mutate(total_coef_feature = sum(arragne_value)) %>%
+  ungroup() %>%
+  mutate(direction = ifelse(total_coef_feature > 0, "Positive", "Negative")) %>%
+  dplyr::select(., -total_coef_feature)  %>%
+  arrange(., cytokines_type) %>%
+  mutate(outcome = factor(outcome, levels = unique(outcome))) %>%
+  arrange(., Pathway_group, direction, coef) %>%
+  mutate(feature_new = factor(feature_new, levels = rev(unique(feature_new))),
+         Pathway_group = factor(Pathway_group, levels = unique(Pathway_group)))
+
+(correlation_path_ck_day1 <- ggplot(sig_maaslin_path_ck, aes(x = outcome, y = feature_new)) +
+    geom_tile(aes(fill = coef), color = "grey") +
+    geom_text(aes(label = ifelse(qval < 0.05, "***",
+                                 ifelse(qval < 0.1, "**",
+                                        ifelse(qval < 0.20, "*", "")))),
+              color = "black", size = 4) +
+    scale_fill_gradient2(
+      low = "#58B4E9",
+      mid = "white",
+      high = "firebrick3",
+      midpoint = 0
+    ) +
+    theme_classic() +
+    theme(
+      axis.text.x = element_blank(),
+      axis.text.y =  element_blank(),
+      axis.title.x =  element_blank(),
+      axis.title.y =  element_blank(),
+      panel.background = element_blank(),
+
+      legend.key.size = unit(.5, "cm"),
+      legend.text = element_text(size = 10, color = "black"),
+      legend.title = element_text(face = "bold", size = 10, color = "black"),
+      panel.border = element_rect(color = "black", size = .5, fill = NA),
+
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    labs(
+      fill = "MaAsLin2 Coefficient"
+    ))
+
+(info_cy_path <- ggplot(sig_maaslin_path_ck, aes(x = outcome, y = "Immune Mediators Type")) +
+    geom_tile(aes(fill = cytokines_type, color = cytokines_type)) +
+    scale_fill_manual(values = c("#D7E69A", "#FAF299", "#FAF299", "#FAA69A","#D79CBB", "#60A199","#9D8292"),
+                      name = "Immune Mediators Type") +
+    scale_color_manual(values = c("#D7E69A", "#FAF299", "#FAF299", "#FAA69A", "#D79CBB","#60A199","#9D8292"),
+                       name = "Immune Mediators Type") +
+    theme_minimal() +
+    scale_y_discrete(position = "left") +
+    labs(
+
+      x = "Immune Mediators Day 1",
+    )+
+    theme(
+      axis.text.x = element_text(size = 10, color = "black", face = "bold", angle = 45, hjust = 1),
+      axis.title.x = element_text(size = 12, color = "black", face = "bold"),
+
+      axis.text.y = element_blank(),
+      axis.title = element_blank(),
+      panel.background = element_blank(),
+
+      legend.key.size = unit(.5, "cm"),
+      legend.text = element_text(size = 10, color = "black"),
+
+      legend.title = element_text(size = 10, color = "black", face = "bold")
+    ))
+
+(info_path_ck <- ggplot(sig_maaslin_path_ck, aes(y = feature_new, x = "Pathways Type")) +
+    geom_tile(aes(fill = Pathway_group , color = Pathway_group)) +
+    scale_fill_manual(values = alpha(c("#5a9edb", "#b0d74b", "#d9d94d", "#e5a14d", "#e56b6b"),  1), name = "Pathways Type")+
+    scale_color_manual(values = alpha(c("#5a9edb", "#b0d74b", "#d9d94d", "#e5a14d", "#e56b6b"),  1), name = "Pathways Type")+
+    scale_x_discrete(position = "top") +
+    theme_minimal() +
+    labs(
+    y = "Microbial Functional Pathway Baseline"
+    )+
+    theme(
+      axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+      axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+      axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+      axis.title = element_blank(),
+      panel.background = element_blank(),
+
+      legend.key.size = unit(.5, "cm"),
+      legend.text = element_text(size = 10, color = "black"),
+
+      legend.title = element_text(size = 10, color = "black", face = "bold")
+    ))
+
+correlation_path_ck_day1_final <- info_path_ck + correlation_path_ck_day1 + info_cy_path +
+  plot_layout(nrow = 2,
+              guides = "collect",
+
+              design = layout_custom
+  ) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"),
+
+        panel.spacing = unit(0, "pt"))
+correlation_path_ck_day1_final
+
+ggplot2::ggsave(file.path(output_dir, "MaAsLin_cor", "correlation_path_ck_day1_final.pdf"),
+                correlation_path_ck_day1_final,width = 35,height = 16,units = "cm")
+
+sig_nb_ck <- sig_maaslin_path_ck %>%
+  group_by(metadata) %>%
+  summarise(
+    pos_path = sum(coef > 0 & qval < 0.2, na.rm = TRUE),
+    neg_path = sum(coef < 0 & qval < 0.2, na.rm = TRUE)
+  )
+
+sig_nb_ck <- sig_results_gmb_ck %>%
+  group_by(metadata) %>%
+  summarise(
+    pos_gmb = sum(coef > 0 & qval < 0.2, na.rm = TRUE),
+    neg_gmb = sum(coef < 0 & qval < 0.2, na.rm = TRUE)
+  ) %>%
+  merge(.,sig_nb_ck, by = "metadata", all = T) %>%
+  mutate(outcome = recode(metadata,
+                          "SE_SELETION" = "sE-selectin",
+                          "SIGLEC_5" = "Siglec-5",
+                          "TNF_a" = "TNF-alpha"),
+         outcome = sub("_", "-", outcome))
+
+sig_nb_ck[is.na(sig_nb_ck)] <- 0
+sig_nb_ck$cytokines_type <- type_cytokines$Type[match(sig_nb_ck$outcome, type_cytokines$Names)]
+sig_nb_ck <- mutate(sig_nb_ck,
+                         cytokines_type = factor(cytokines_type,
+                                                 levels = rev(c("Chemokines", "Cytokines","Cytokine Receptors", "Immunomarkers",
+                                                                "Adhesion Molecules", "Enzymes", "Hormones"))
+                                                              ))
+
+sig_nb_ck_long <- sig_nb_ck %>%
+  pivot_longer(
+    cols = c(pos_gmb, pos_path, neg_gmb, neg_path),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+sig_nb_ck_long <- mutate(sig_nb_ck_long,
+                         outcome = as.character(outcome),
+                         outcome = factor(outcome, levels = sig_nb_ck %>%
+                                            mutate(total = pos_gmb + pos_path + neg_gmb + neg_path) %>%
+                                            arrange(cytokines_type, total) %>% pull(outcome)
+                         ))
+
+fill_colors <- c(
+  "pos_gmb" = "#CD2626",
+  "pos_path" = "#F1B3B3",
+  "neg_gmb" = "#58B4E9",
+  "neg_path" = "#bce1f2"
+)
+
+sig_nb_ck_plot <- ggplot(sig_nb_ck_long, aes(y = outcome, x = value, fill = variable)) +
+  geom_col(position = "stack", width = 0.7) +
+  scale_fill_manual(
+    name = "Correlation Type",
+    values = fill_colors,
+    labels = c(
+      "pos_gmb" = "Positive Species",
+      "pos_path" = "Positive Pathways",
+      "neg_gmb" = "Negative Species",
+      "neg_path" = "Negative Pathways"
+    )
+  ) +
+  labs(
+    title = "Number of MaAsLin2 FDR < 0.2",
+
+    x = "Number \n of associations",
+    y = "Immune Mediators Day 1"
+  ) +
+  scale_x_continuous(expand = c(0, 0), breaks = c(0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52)) +
+  theme_minimal() +
+  theme(
+
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(face = "bold", size = 10, color = "black"),
+    axis.title.x = element_text(face = "bold", size = 12, color = "black"),
+    axis.line = element_line(size = 0.8),
+    axis.ticks = element_line(size = 0.8),
+    legend.position = c(0.8, 0.2),
+    legend.key.size = unit(.5, "cm"),
+    legend.text = element_text(size = 10, color = "black"),
+    legend.title = element_text(face = "bold", size = 10, color = "black"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+sig_nb_ck_plot
+
+(info_ck_nb <- ggplot(sig_nb_ck_long, aes(y = outcome, x = "Immune Mediators Type")) +
+    geom_tile(aes(fill = cytokines_type, color = cytokines_type)) +
+    scale_fill_manual(values = rev(c("#D7E69A", "#FAF299", "#FAF299", "#D79CBB","#FAA69A", "#60A199","#9D8292")),
+                      name = "Immune Mediators Type") +
+    scale_color_manual(values = rev(c("#D7E69A", "#FAF299", "#FAF299", "#D79CBB","#FAA69A", "#60A199","#9D8292")),
+                       name = "Immune Mediators Type") +
+    theme_minimal() +
+    guides(fill = guide_legend(reverse = TRUE),
+           color = guide_legend(reverse = TRUE))+
+    scale_x_discrete(position = "top") +
+    labs(
+
+      y = "Immune Mediators Day 1",
+    )+
+    theme(
+      axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+      axis.title.y = element_text(size = 12, color = "black", face = "bold"),
+      axis.text.x = element_text(size = 10, color = "black", face = "bold"),
+
+      axis.title.x = element_blank(),
+      panel.background = element_blank(),
+
+      legend.key.size = unit(.5, "cm"),
+      legend.text = element_text(size = 10, color = "black"),
+      legend.title = element_text(face = "bold", size = 10, color = "black")
+    ))
+
+area_1 <- patchwork::area(t = 1, l = 1, b = 20, r = 1)
+area_2 <- patchwork::area(t = 1, l = 2, b = 20, r = 25)
+
+layout_custom <- c(area_2, area_1)
+
+sig_nb_ck_plot_final <- sig_nb_ck_plot + info_ck_nb +
+  plot_layout(nrow = 1,
+              guides = "collect",
+
+              design = layout_custom
+  ) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"),
+
+        panel.spacing = unit(0, "pt"))
+sig_nb_ck_plot_final
+
+ggplot2::ggsave(file.path(output_dir, "Mediation", "sig_nb_ck_plot_final.pdf"),
+                sig_nb_ck_plot_final,width = 18,height = 16,units = "cm")
+
+df_ck_long <- dat_cytokines_day1_log %>%
+  dplyr::select(unique(sig_nb_ck_long$metadata)) %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(
+    cols = -Sample,
+    names_to = "metadata",
+    values_to = "Value"
+  ) %>%
+  merge(., dplyr::select(sig_nb_ck_long, metadata, outcome, cytokines_type), by.x = "metadata", by.y = "metadata", all.x = T)
+
+(plot_ab_ck <- ggplot(df_ck_long, aes(x = outcome,
+                                          color = cytokines_type,
+                                          y = Value)) +
+    stat_summary(
+      fun = median,
+      geom = "point",
+      shape = 17,
+      size = 4
+    ) +
+
+    scale_color_manual(values = rev(c("#D7E69A", "#FAF299", "#FAF299", "#D79CBB","#FAA69A", "#60A199","#9D8292")),
+                       breaks = levels(df_ck_long$cytokines_type),
+                       name = "Immune Mediators Type") +
+    guides(color = guide_legend(reverse = TRUE)) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(limits = c(-2, 18))+
+    theme_classic()+
+    theme(
+      axis.text.x = element_text(color = "black", face = "bold", size = 10),
+      axis.title.x = element_text(face = "bold", size = 12),
+      axis.title.y = element_text(face = "bold", size = 12),
+
+      axis.text.y = element_text(color = "black", face = "bold", size = 10),
+
+      legend.position = "right",
+
+      panel.grid.major = element_line(color = "gray90"),
+      panel.background = element_blank(),
+      panel.border = element_rect(color = "black", size = .5, fill = NA),
+    ) +
+    labs(x = "Immune Mediators Day 1", y = "Median Log(levels)")+
+    guides(
+      fill = guide_legend(
+        override.aes = list(shape = 21, color = "black", size = 4)
+      )
+    )
+)
+
+area_ck_1 <- patchwork::area(t = 1, l = 1, b = 20, r = 8)
+area_ck_2 <- patchwork::area(t = 1, l = 9, b = 20, r = 16)
+
+layout_custom_ck <- c(area_ck_1, area_ck_2)
+
+sig_nb_ck_plot_final_2 <- plot_ab_ck + sig_nb_ck_plot +
+  plot_layout(nrow = 1,
+              guides = "collect",
+
+              design = layout_custom_ck
+  ) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"),
+
+        panel.spacing = unit(0, "pt"))
+sig_nb_ck_plot_final_2
+
+ggplot2::ggsave(file.path(output_dir, "Mediation", "sig_nb_ck_plot_final_3.pdf"),
+                sig_nb_ck_plot_final_2,width = 14,height = 16,units = "cm")
+
+selected_immune_mediators <- unique(sig_nb_ck$metadata)
+immune_mediator_day1 <- dat_cytokines_day1_log[
+  ,
+  selected_immune_mediators,
+  drop = FALSE
+]
+immune_mediator_baseline <- dat_cytokines_baseline_log[
+  ,
+  selected_immune_mediators,
+  drop = FALSE
+]
+
+res_diversity_ck <- dplyr::bind_rows(
+  run_diversity_associations(
+    diversity_gmb,
+    immune_mediator_day1,
+    dat_metadata_2,
+    baseline_data = immune_mediator_baseline
+  ) %>%
+    dplyr::mutate(metag = "Species diversity"),
+  run_diversity_associations(
+    diversity_path,
+    immune_mediator_day1,
+    dat_metadata_2,
+    baseline_data = immune_mediator_baseline
+  ) %>%
+    dplyr::mutate(metag = "Pathway diversity")
+) %>%
+  dplyr::mutate(
+    minuslog10FDR = -log10(pmax(FDR_p_value, .Machine$double.xmin))
+  ) %>%
+  dplyr::left_join(
+    sig_nb_ck %>%
+      dplyr::select(metadata, outcome, cytokines_type) %>%
+      dplyr::distinct(),
+    by = c("y_variable" = "metadata")
+  )
+
+max_abs_ck <- max(abs(res_diversity_ck$coefficient), na.rm = TRUE)
+
+plot_diversity_ck <- ggplot(
+  res_diversity_ck,
+  aes(x = x_variable, y = forcats::fct_rev(outcome))
+) +
+  geom_point(
+    data = subset(res_diversity_ck, FDR_p_value >= 0.2),
+    aes(size = minuslog10FDR),
+    shape = 21,
+    fill = "grey80",
+    color = "white",
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = subset(res_diversity_ck, FDR_p_value < 0.2),
+    aes(fill = coefficient, size = minuslog10FDR),
+    shape = 21,
+    color = "white"
+  ) +
+  scale_fill_gradient2(
+    low = "#58B4E9",
+    mid = "white",
+    high = "firebrick3",
+    midpoint = 0,
+    limits = c(-max_abs_ck, max_abs_ck),
+    name = "Regression coefficient"
+  ) +
+  scale_size_continuous(
+    name = expression(-log[10](FDR~p)),
+    range = c(2, 6)
+  ) +
+  facet_wrap(~ metag, nrow = 1, scales = "free_x") +
+  theme_classic() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(color = "black", linewidth = 0.5, fill = NA),
+    axis.title = element_text(size = 10, color = "black", face = "bold"),
+    axis.text.x = element_text(
+      size = 10,
+      color = "black",
+      face = "bold",
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    panel.grid.major = element_line(color = "gray90")
+  ) +
+  labs(y = "Immune mediators day 1", x = "Diversity indicator")
+
+ggsave(
+  file.path(output_dir, "Diversity", "plot_diversity_ck.pdf"),
+  plot_diversity_ck,
+  width = 18,
+  height = 10,
+  units = "cm"
+)
+
+name_metag_ck <- dplyr::bind_rows(
+  sig_maaslin_path_ck %>%
+    dplyr::filter(qval < 0.2) %>%
+    dplyr::transmute(feature, cytokine = metadata),
+  sig_results_gmb_ck %>%
+    dplyr::filter(qval < 0.2) %>%
+    dplyr::transmute(feature, cytokine = metadata)
+) %>%
+  dplyr::distinct()
+
+name_metag_GMT <- dplyr::bind_rows(
+  sig_results %>%
+    dplyr::filter(qval < 0.2) %>%
+    dplyr::transmute(feature = as.character(feature), GMT = as.character(outcome)),
+  sig_results_path %>%
+    dplyr::filter(qval < 0.2) %>%
+    dplyr::transmute(
+      feature = as.character(Pathway_ID),
+      GMT = as.character(GMT)
+    )
+) %>%
+  dplyr::distinct()
+
+name_metag_ck_GMT <- dplyr::inner_join(
+  name_metag_ck,
+  name_metag_GMT,
+  by = "feature"
+)
+
+feature_matrix_for_mediation <- cbind(dat_gmb_log, dat_path2_ha_log)
+
+run_mediation_candidate <- function(feature, cytokine, GMT) {
+  ids <- Reduce(
+    intersect,
+    list(
+      dat_metadata_2_day14$ID,
+      rownames(feature_matrix_for_mediation),
+      rownames(dat_cytokines_day1_log),
+      rownames(dat_cytokines_baseline_log),
+      rownames(dat_GMT_day14_log),
+      rownames(dat_GMT_baseline_log)
+    )
+  )
+
+  model_data <- dat_metadata_2_day14[
+    match(ids, dat_metadata_2_day14$ID),
+    ,
+    drop = FALSE
+  ]
+  model_data$x <- feature_matrix_for_mediation[ids, feature]
+  model_data$m <- dat_cytokines_day1_log[ids, cytokine]
+  model_data$y <- dat_GMT_day14_log[ids, GMT]
+  model_data$ck_baseline <- dat_cytokines_baseline_log[ids, cytokine]
+  model_data$gmt_baseline <- dat_GMT_baseline_log[ids, GMT]
+  model_data <- model_data[complete.cases(model_data), , drop = FALSE]
+
+  tryCatch({
+    fit_m <- lm(
+      m ~ x + Gender + Age + BMI + Vaccination + ck_baseline,
+      data = model_data
+    )
+    fit_y <- lm(
+      y ~ x + m + Gender + Age + BMI + Vaccination + gmt_baseline,
+      data = model_data
+    )
+    set.seed(2025)
+    fit_med <- mediation::mediate(
+      fit_m,
+      fit_y,
+      sims = 999,
+      treat = "x",
+      mediator = "m",
+      boot = TRUE
+    )
+    med_summary <- summary(fit_med)
+
+    tibble::tibble(
+      feature = feature,
+      cytokine = cytokine,
+      GMT = GMT,
+      p_med = med_summary$n.avg.p,
+      est_med = med_summary$n.avg,
+      ci2.5_med = med_summary$n.avg.ci[1],
+      ci97.5_med = med_summary$n.avg.ci[2],
+      xy_beta = coef(summary(fit_y))["x", 1],
+      xy_p = coef(summary(fit_y))["x", 4],
+      xm_beta = coef(summary(fit_m))["x", 1],
+      xm_p = coef(summary(fit_m))["x", 4],
+      my_beta = coef(summary(fit_y))["m", 1],
+      my_p = coef(summary(fit_y))["m", 4],
+      total_beta = med_summary$tau.coef,
+      total_p = med_summary$tau.p
+    )
+  }, error = function(e) {
+    tibble::tibble(
+      feature = feature,
+      cytokine = cytokine,
+      GMT = GMT,
+      p_med = NA_real_,
+      est_med = NA_real_,
+      ci2.5_med = NA_real_,
+      ci97.5_med = NA_real_,
+      xy_beta = NA_real_,
+      xy_p = NA_real_,
+      xm_beta = NA_real_,
+      xm_p = NA_real_,
+      my_beta = NA_real_,
+      my_p = NA_real_,
+      total_beta = NA_real_,
+      total_p = NA_real_
+    )
+  })
+}
+
+res_metag_ck_GMT <- purrr::pmap_dfr(
+  name_metag_ck_GMT,
+  run_mediation_candidate
+)
+
+sig_res_metag_ck_GMT <- res_metag_ck_GMT %>%
+  dplyr::filter(p_med < 0.05, est_med > 0)
+
+cytokine_gmt_effects <- sig_res_metag_ck_GMT %>%
+  dplyr::distinct(cytokine, GMT) %>%
+  purrr::pmap_dfr(function(cytokine, GMT) {
+    ids <- dat_metadata_2_day14$ID
+    model_data <- dat_metadata_2_day14
+    model_data$y <- dat_GMT_day14_log[ids, GMT]
+    model_data$m <- dat_cytokines_day1_log[ids, cytokine]
+    model_data$gmt_baseline <- dat_GMT_baseline_log[ids, GMT]
+    fit <- lm(
+      y ~ m + gmt_baseline + Gender + Age + BMI + Vaccination,
+      data = model_data,
+      na.action = na.exclude
+    )
+    tibble::tibble(
+      cytokine = cytokine,
+      GMT = GMT,
+      lm_coef = coef(summary(fit))["m", 1]
+    )
+  })
+
+metag_cytokine_effects <- dplyr::bind_rows(
+  sig_results_gmb_ck %>%
+    dplyr::transmute(feature, cytokine = metadata, maaslin_coef = coef),
+  sig_maaslin_path_ck %>%
+    dplyr::transmute(feature, cytokine = metadata, maaslin_coef = coef)
+) %>%
+  dplyr::distinct(feature, cytokine, .keep_all = TRUE)
+
+df_alluv <- sig_res_metag_ck_GMT %>%
+  dplyr::left_join(cytokine_gmt_effects, by = c("cytokine", "GMT")) %>%
+  dplyr::left_join(metag_cytokine_effects, by = c("feature", "cytokine")) %>%
+  dplyr::mutate(
+    feature = stringr::str_replace_all(feature, "Path_", ""),
+    feature = stringr::str_replace_all(
+      feature,
+      "s__Klebsiella_pneumoniae",
+      "K. pneumoniae"
+    ),
+    feature = stringr::str_replace_all(
+      feature,
+      "s__Parabacteroides_merdae",
+      "P. merdae"
+    ),
+    feature = stringr::str_replace_all(
+      feature,
+      "FASYN_INITIAL_PWY",
+      "FASYN-INITIAL-PWY"
+    ),
+    feature = stringr::str_replace_all(feature, "_", "-"),
+    feature = factor(
+      feature,
+      c(
+        "K. pneumoniae", "P. merdae", "FASYN-INITIAL-PWY",
+        "PWY-7229", "PWY-7357", "CALVIN-PWY"
+      )
+    ),
+    cytokine = factor(cytokine, levels = c("CCL2", "CXCL10", "TNFR2", "CHI3L1")),
+    GMT = factor(GMT, levels = c("Prototype", "Beta", "BQ.1.1", "JN.1"))
+  ) %>%
+  dplyr::select(feature, cytokine, GMT, maaslin_coef, lm_coef)
+
+feature_coef_map <- df_alluv %>%
+  group_by(feature) %>%
+  summarise(
+    coef_txt = paste0(
+      sprintf("%.3f", unique(maaslin_coef)),
+      collapse = "\n\n"
+    ),
+    .groups = "drop"
+  ) %>%
+  tibble::deframe()
+
+cytokine_coef_map <- df_alluv %>%
+  group_by(cytokine) %>%
+  summarise(
+    coef_txt = paste0(
+      sprintf("%.3f", unique(lm_coef)),
+      collapse = "\n"
+    ),
+    .groups = "drop"
+  ) %>%
+  tibble::deframe()
+
+(plot_alluv <- ggplot(
+  data = df_alluv,
+  aes(
+    axis1 = feature,
+    axis2 = cytokine,
+    axis3 = GMT
+  )
+) +
+
+  geom_alluvium(aes(fill = cytokine), width = 0.5, alpha = 0.7) +
+      scale_fill_manual(
+        name = "Immune Mediators",
+        values = c("#c8d494","#C1E488","#F9F198","#dba8c3"))+
+
+  geom_stratum(width = 0.5, alpha = 0.6) +
+
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3,fontface = "bold") +
+    annotate("text",
+             x = 1.2,
+             y = 14.4,
+             label = "MaAslin2 coefficients",
+             fontface = "bold",
+             size = 3,
+             hjust = 0) +
+    annotate("text",
+             x = 2.2,
+             y = 14.4,
+             label = "Regression coefficients",
+             fontface = "bold",
+             size = 3,
+             hjust = 0) +
+
+    geom_text(
+      stat = "stratum",
+      aes(
+        label = after_stat(
+          ifelse(
+            x == 1,
+            feature_coef_map[stratum],
+            ""
+          )
+        )
+      ),
+      size = 3.5,
+
+      lineheight = 1,
+      hjust = 0,
+      position = position_nudge(x = 0.22)
+    ) +
+    geom_text(
+      stat = "stratum",
+      aes(
+        label = after_stat(
+          ifelse(
+            x == 1,
+            cytokine_coef_map[stratum],
+            ""
+          )
+        )
+      ),
+      size = 3.5,
+      lineheight = 1,
+      hjust = 0,
+      vjust = 1.5,
+      position = position_nudge(x = 1.22),
+      na.rm = T
+    )+
+
+  scale_x_discrete(
+    limits = c("Metagenomic Features \n Baseline (X)", "Immune Mediators \n Day 1 (M)", "Neutralizing Antibodies \n Day 14 (Y)"),
+    expand = c(0.05, 0.05)
+  ) +
+
+  theme_minimal() +
+  labs(title = "Sankey Diagram of Feature-Cytokine-GMT") +
+  theme(
+    panel.grid = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.text.x = element_text(size = 10, colour = "black", face = "bold"),
+    legend.title = element_text(size = 10, colour = "black", face = "bold"),
+    legend.position = "bottom",
+    plot.margin = unit(c(2, 2, 2, 2), "cm")
+  ))
+
+ggplot2::ggsave(file.path(output_dir, "Mediation", "alluv_plot_4.pdf"),
+                plot_alluv,width = 30,height = 20,units = "cm")
+
+ia_metag_GMT_ck <- tidyr::crossing(
+  name_metag_GMT,
+  ck_name = colnames(dat_cytokines_baseline_log)
+) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.character))
+
+run_interaction_model <- function(feature, GMT, ck_name) {
+  ids <- Reduce(
+    intersect,
+    list(
+      dat_metadata_2_day14$ID,
+      rownames(feature_matrix_for_mediation),
+      rownames(dat_cytokines_baseline_log),
+      rownames(dat_GMT_day14_log),
+      rownames(dat_GMT_baseline_log)
+    )
+  )
+  model_data <- dat_metadata_2_day14[
+    match(ids, dat_metadata_2_day14$ID),
+    ,
+    drop = FALSE
+  ]
+  model_data$x <- feature_matrix_for_mediation[ids, feature]
+  model_data$m <- dat_cytokines_baseline_log[ids, ck_name]
+  model_data$y <- dat_GMT_day14_log[ids, GMT]
+  model_data$gmt_baseline <- dat_GMT_baseline_log[ids, GMT]
+  fit <- lm(
+    y ~ x * m + Gender + Age + BMI + Vaccination + gmt_baseline,
+    data = model_data,
+    na.action = na.exclude
+  )
+  coefficient_table <- coef(summary(fit))
+
+  tibble::tibble(
+    feature = feature,
+    GMT = GMT,
+    ck_name = ck_name,
+    MetaF_beta = coefficient_table["x", 1],
+    MetaF_sd = coefficient_table["x", 2],
+    MetaF_p = coefficient_table["x", 4],
+    IM_beta = coefficient_table["m", 1],
+    IM_sd = coefficient_table["m", 2],
+    IM_p = coefficient_table["m", 4],
+    ia_beta = coefficient_table["x:m", 1],
+    ia_sd = coefficient_table["x:m", 2],
+    ia_p = coefficient_table["x:m", 4]
+  )
+}
+
+all_res_lm_ia <- purrr::pmap_dfr(
+  ia_metag_GMT_ck,
+  run_interaction_model
+)
+
+all_res_lm_ia$ia_fdr <- p.adjust(all_res_lm_ia$ia_p, method = "BH")
+
+key_res_lm_ia <- filter(all_res_lm_ia, ck_name %in% sig_nb_ck$metadata)
+key_res_lm_ia$ia_fdr <- p.adjust(key_res_lm_ia$ia_p, method = "BH")
+
+filter(key_res_lm_ia, ia_p < 0.05)
+filter(key_res_lm_ia, ia_fdr < 0.2)
+
+sig_results_day0$feature_label[match(key_res_lm_ia$feature, sig_results_day0$feature)]
+
+MetaF_label <- rbind(select(sig_results_day0, feature, feature_label),
+                     select(sig_results_path, feature, Pathway_ID) %>% rename(feature_label = feature, feature = Pathway_ID))
+
+key_res_lm_ia <- mutate(key_res_lm_ia, feature = MetaF_label$feature_label[match(key_res_lm_ia$feature, MetaF_label$feature)],
+       ck_name = sig_nb_ck$outcome[match(key_res_lm_ia$ck_name, sig_nb_ck$metadata)])
+
+df_plot <- key_res_lm_ia %>%
+  mutate(Outcome = GMT) %>%
+  filter(ia_p < 0.05)
+
+edge_w_lim <- range(-log10(pmax(df_plot$ia_p, 1e-300)), na.rm = TRUE)
+edge_a_lim <- range(abs(df_plot$ia_beta), na.rm = TRUE)
+
+max_abs_ia   <- max(abs(df_plot$ia_beta), na.rm = TRUE)
+edge_col_lim <- c(-max_abs_ia, max_abs_ia)
+
+main_beta_all <- c(df_plot$MetaF_beta, df_plot$IM_beta)
+max_abs_main  <- max(abs(main_beta_all), na.rm = TRUE)
+fill_lim      <- c(-max_abs_main, max_abs_main)
+
+node_size_all <- -log10(pmax(c(df_plot$MetaF_p, df_plot$IM_p), 1e-300))
+node_size_lim <- range(node_size_all, na.rm = TRUE)
+
+plot_list_ia <- df_plot %>%
+  group_by(GMT) %>%
+  group_map(~{
+    d <- .x
+
+    edges_df <- d %>%
+      transmute(from = feature, to = ck_name,
+                ia_beta = ia_beta,
+                ia_w    = -log10(pmax(ia_p, 1e-300)))
+
+    nodes_df <- bind_rows(
+      d %>% transmute(name = feature, type = "feature",
+                      main_beta = MetaF_beta, main_p = MetaF_p),
+      d %>% transmute(name = ck_name, type = "ck",
+                      main_beta = IM_beta,    main_p = IM_p)
+    ) %>%
+      distinct(name, .keep_all = TRUE) %>%
+      mutate(node_size = -log10(pmax(main_p, 1e-300)))
+
+    g <- igraph::graph_from_data_frame(edges_df, vertices = nodes_df, directed = FALSE)
+    lay <- ggraph::create_layout(g, layout = "circle")
+
+    ggraph::ggraph(lay) +
+
+      ggraph::geom_edge_arc(aes(
+        edge_width  = ia_w,
+        edge_colour = ia_beta,
+        edge_alpha  = abs(ia_beta)
+      ),
+      strength = 0.05, lineend = "round") +
+
+      ggraph::scale_edge_colour_gradient2(
+        low = "#4B1D7A", mid = "grey95", high = "#C25A00",
+        breaks = c(-0.2, -0.1, 0, 0.1, 0.2),
+        midpoint = 0, limits = edge_col_lim,
+        name = "Interaction beta"
+      ) +
+
+      scale_edge_alpha_continuous(limits = edge_a_lim, range = c(0.20, 0.90), guide = "none") +
+      scale_edge_width(limits = edge_w_lim, range = c(0.25, 3.2),
+                       breaks = c(1.5,2.5,3),
+                       name = "Interaction -log10(p)") +
+
+      geom_node_point(aes(fill = main_beta, size = node_size, shape = type, colour = main_beta),
+                      stroke = 0.6, alpha = 0.95) +
+      scale_fill_gradient2(low = "#58B4E9", mid = "grey95", high = "firebrick3",
+                           breaks = c(-0.3, -0.15, 0, 0.15, 0.3),
+                           midpoint = 0, limits = fill_lim, name = "Main beta") +
+      scale_colour_gradient2(low = "#58B4E9", mid = "grey95", high = "firebrick3",
+                             breaks = c(-0.3, -0.15, 0, 0.15, 0.3),
+                             midpoint = 0, limits = fill_lim, name = "Main beta") +
+      scale_size(limits = node_size_lim, range = c(2.5, 12),
+                 breaks = c(1,2,3),
+                 name = "Main -log10(p)") +
+
+      scale_shape_manual(values = c(feature = 21, ck = 22),
+                         labels = c(feature = "Feature", ck = "Immune mediator"),
+                         name = "Node type") +
+
+      geom_node_text(aes(label = name),
+                     fontface = "bold", size = 3.0,
+                     nudge_x = 0.18 * sign(lay$x),
+                     nudge_y = 0.18 * sign(lay$y)) +
+
+      ggtitle(unique(d$Outcome)) +
+      coord_equal(clip = "off") +
+      theme_void() +
+      theme(
+        plot.margin = ggplot2::margin(20, 90, 20, 90),
+        legend.position = "right",
+        legend.box = "vertical",
+        legend.key.size = unit(.5, "cm"),
+        legend.title = element_text(face = "bold")
+      )
+  })
+
+plot_list_ia[[4]]
+
+summary(as.factor(filter(key_res_lm_ia, ia_p < 0.05)$GMT))
+
+plot_MetaF_IM_ia <- patchwork::wrap_plots(list(plot_list_ia[[5]], plot_list_ia[[2]],
+                                               plot_list_ia[[8]], plot_list_ia[[4]])) +
+  patchwork::plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "left"
+
+        )
+plot_MetaF_IM_ia
+
+ggplot2::ggsave(file.path(output_dir, "Interaction", "plot_MetaF_IM_ia.pdf"),
+                plot_MetaF_IM_ia,width = 40,height = 40,units = "cm")
+
+plot_MetaF_IM_ia_sup <- patchwork::wrap_plots(list(plot_list_ia[[1]], plot_list_ia[[3]],
+                                               plot_list_ia[[6]], plot_list_ia[[7]])) +
+  patchwork::plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "left"
+
+  )
+plot_MetaF_IM_ia_sup
+
+ggplot2::ggsave(file.path(output_dir, "Interaction", "plot_MetaF_IM_ia_sup.pdf"),
+                plot_MetaF_IM_ia_sup,width = 30,height = 30,units = "cm")
+
+plot_MetaF_IM_ia_all <- patchwork::wrap_plots(plot_list_ia) +
+  patchwork::plot_layout(ncol = 4, guides = "collect") &
+  theme(legend.position = "left",
+        legend.box = "vertical")
+plot_MetaF_IM_ia_all
+
+ggplot2::ggsave(file.path(output_dir, "Interaction", "plot_MetaF_IM_ia_all.pdf"),
+                plot_MetaF_IM_ia_all,width = 70,height = 40,units = "cm")
+
+adverse_factor_names <- c(
+  "pain_factor", "swelling_factor", "acute.allergic.reaction_factor",
+  "vomitting_factor", "jonit.pain_factor", "Muscular.pain_factor",
+  "headache_factor", "cold_factor", "fatigue_factor", "fever_factor"
+)
+
+dat_metadata_3 <- dat_metadata_2 %>%
+  dplyr::mutate(
+    pain_factor = factor(ifelse(pain < 2, 0, 1)),
+    swelling_factor = factor(ifelse(swelling == 0, 0, 1)),
+    acute.allergic.reaction_factor = factor(
+      ifelse(acute.allergic.reaction == 0, 0, 1)
+    ),
+    vomitting_factor = factor(ifelse(vomitting == 0, 0, 1)),
+    jonit.pain_factor = factor(ifelse(jonit.pain == 0, 0, 1)),
+    Muscular.pain_factor = factor(ifelse(Muscular.pain == 0, 0, 1)),
+    headache_factor = factor(ifelse(headache == 0, 0, 1)),
+    cold_factor = factor(ifelse(cold == 0, 0, 1)),
+    fatigue_factor = factor(ifelse(fatigue == 0, 0, 1)),
+    fever_factor = factor(ifelse(fever == 0, 0, 1)),
+    local_ar = pain + swelling + acute.allergic.reaction,
+    systematic_ar = (
+      vomitting + jonit.pain + Muscular.pain + headache + cold + fatigue + fever
+    )
+  )
+
+adverse_labels <- c(
+  pain_factor = "Pain",
+  swelling_factor = "Swelling",
+  acute.allergic.reaction_factor = "Acute allergic reaction",
+  vomitting_factor = "Vomiting",
+  jonit.pain_factor = "Joint pain",
+  Muscular.pain_factor = "Muscular pain",
+  headache_factor = "Headache",
+  cold_factor = "Cold",
+  fatigue_factor = "Fatigue",
+  fever_factor = "Fever",
+  local_ar = "Local adverse reaction",
+  systematic_ar = "Systemic adverse reaction"
+)
+
+adverse_outcome_data <- dat_metadata_3 %>%
+  dplyr::select(ID, dplyr::all_of(adverse_factor_names), local_ar, systematic_ar) %>%
+  tibble::column_to_rownames("ID")
+
+res_diversity_ar <- dplyr::bind_rows(
+  run_diversity_associations(
+    diversity_gmb,
+    adverse_outcome_data[, adverse_factor_names, drop = FALSE],
+    dat_metadata_3,
+    outcomes = adverse_factor_names,
+    family = binomial()
+  ) %>%
+    dplyr::mutate(metag = "Species diversity"),
+  run_diversity_associations(
+    diversity_path,
+    adverse_outcome_data[, adverse_factor_names, drop = FALSE],
+    dat_metadata_3,
+    outcomes = adverse_factor_names,
+    family = binomial()
+  ) %>%
+    dplyr::mutate(metag = "Pathway diversity")
+) %>%
+  dplyr::mutate(
+    adverse_event = factor(
+      unname(adverse_labels[y_variable]),
+      levels = unname(adverse_labels[adverse_factor_names])
+    ),
+    diversity_indicator = factor(
+      x_variable,
+      levels = rev(c(
+        "Richness", "Shannon Index", "Simpson Index", "PCo1", "PCo2", "PCo3"
+      ))
+    ),
+    minuslog10FDR = -log10(pmax(FDR_p_value, .Machine$double.xmin))
+  )
+
+max_abs_ar <- max(abs(res_diversity_ar$coefficient), na.rm = TRUE)
+
+plot_diversity_ar <- ggplot(
+  res_diversity_ar,
+  aes(x = adverse_event, y = diversity_indicator)
+) +
+  geom_point(
+    aes(size = minuslog10FDR),
+    shape = 21,
+    fill = "grey80",
+    color = "white",
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = subset(res_diversity_ar, p_value < 0.05 | FDR_p_value < 0.2),
+    aes(fill = coefficient, size = minuslog10FDR),
+    shape = 21,
+    color = "white"
+  ) +
+  scale_fill_gradient2(
+    low = "#58B4E9",
+    mid = "white",
+    high = "firebrick3",
+    midpoint = 0,
+    limits = c(-max_abs_ar, max_abs_ar)
+  ) +
+  scale_size_continuous(name = expression(-log[10](FDR~p)), range = c(2, 6)) +
+  facet_wrap(~ metag, nrow = 1) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(
+      size = 10,
+      color = "black",
+      face = "bold",
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    axis.title = element_text(size = 10, color = "black", face = "bold"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90")
+  ) +
+  labs(x = "Adverse reaction", y = "Diversity indicator")
+
+ggsave(
+  file.path(output_dir, "Diversity", "plot_diversity_ar.pdf"),
+  plot_diversity_ar,
+  width = 22,
+  height = 9,
+  units = "cm"
+)
+
+outcome_name <- c(adverse_factor_names, "local_ar", "systematic_ar")
+
+final_res_maaslin_ar <- run_maaslin_outcomes(
+  dat_gmb_log,
+  adverse_outcome_data,
+  dat_metadata_3,
+  "species_adverse_reaction",
+  outcomes = outcome_name,
+  covariates = c("Gender", "Age", "BMI")
+)
+
+final_res_maaslin_path_ar <- run_maaslin_outcomes(
+  dat_path2_ha_log,
+  adverse_outcome_data,
+  dat_metadata_3,
+  "pathway_adverse_reaction",
+  outcomes = outcome_name,
+  covariates = c("Gender", "Age", "BMI")
+)
+
+sig_species_ar_names <- final_res_maaslin_ar %>%
+  dplyr::group_by(feature) %>%
+  dplyr::summarise(selected = any(qval < 0.2), .groups = "drop") %>%
+  dplyr::filter(selected) %>%
+  dplyr::pull(feature)
+
+sig_results_ar <- final_res_maaslin_ar %>%
+  dplyr::filter(feature %in% sig_species_ar_names) %>%
+  dplyr::transmute(
+    feature,
+    outcome = factor(
+      unname(adverse_labels[outcome]),
+      levels = unname(adverse_labels[outcome_name])
+    ),
+    coef,
+    qval,
+    pval,
+    feature_label = paste0(
+      sub("_", " ", sub("s__", "", feature)),
+      ifelse(feature %in% as.character(sig_results$feature), "*", "")
+    ),
+    fill_val = ifelse(pval < 0.05 | qval < 0.2, coef, NA_real_)
+  )
+
+sig_path_ar_names <- final_res_maaslin_path_ar %>%
+  dplyr::group_by(feature) %>%
+  dplyr::summarise(selected = any(qval < 0.2), .groups = "drop") %>%
+  dplyr::filter(selected) %>%
+  dplyr::pull(feature)
+
+sig_results_path_ar <- final_res_maaslin_path_ar %>%
+  dplyr::filter(feature %in% sig_path_ar_names) %>%
+  dplyr::left_join(Pathway_id_name, by = "feature") %>%
+  dplyr::transmute(
+    feature = sub("_", "-", sub("Path_", "", feature)),
+    outcome = factor(
+      unname(adverse_labels[outcome]),
+      levels = unname(adverse_labels[outcome_name])
+    ),
+    coef,
+    qval,
+    pval,
+    feature_label = paste0(
+      sub("_", "-", sub("Path_", "", feature)),
+      ": ",
+      Pathway,
+      ifelse(feature %in% sig_gmt_14_name, "*", "")
+    ),
+    fill_val = ifelse(pval < 0.05 | qval < 0.2, coef, NA_real_)
+  )
+
+sig_results_metag_ar <- dplyr::bind_rows(
+  sig_results_path_ar,
+  sig_results_ar
+)
+
+plot_metag_ar <- ggplot(
+  sig_results_metag_ar,
+  aes(x = outcome, y = feature_label)
+) +
+  geom_tile(aes(fill = fill_val), color = "grey") +
+  geom_text(
+    aes(label = ifelse(
+      qval < 0.05,
+      "***",
+      ifelse(qval < 0.1, "**", ifelse(qval < 0.2, "*", ""))
+    )),
+    color = "black",
+    size = 4
+  ) +
+  scale_fill_gradient2(
+    low = "#58B4E9",
+    mid = "white",
+    high = "firebrick3",
+    midpoint = 0,
+    na.value = "white"
+  ) +
+  theme_classic() +
+  theme(
+    panel.border = element_rect(color = "black", linewidth = 0.5, fill = NA),
+    axis.text.x = element_text(
+      face = "bold",
+      color = "black",
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(size = 10, color = "black", face = "bold"),
+    axis.title = element_text(size = 10, color = "black", face = "bold"),
+    legend.title = element_text(size = 10, color = "black", face = "bold")
+  ) +
+  labs(
+    x = "Adverse reaction",
+    y = "",
+    fill = "MaAsLin2 coefficient"
+  )
+
+ggsave(
+  file.path(output_dir, "MaAsLin_cor", "plot_metag_ar.pdf"),
+  plot_metag_ar,
+  width = 23,
+  height = 8.5,
+  units = "cm"
+)
